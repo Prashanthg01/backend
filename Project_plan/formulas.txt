@@ -1,0 +1,36 @@
+Total Makespan (Days):
+Makespan (hours) = (Max End Time - Min Start Time) / 3600 seconds
+Makespan (days) = Makespan (hours) / 24
+
+Average Machine Utilization (%):
+Utilization = (Used Hours / Makespan Hours) × 100%
+
+Number of Operations:
+Total Operations = Count of all ProductionSchedule records
+
+Throughput (units/day):
+Throughput = Total Demand Units / Makespan (days)
+
+Batch Size Formula:
+batch_size = ceil(demand_2024 / 12)
+num_batches = 12
+
+For each batch (1 to 12), For each step in the process, Calculate Processing Time:
+Total Time (seconds) = Cycle Time per Unit × Batch Size
+Total Time (hours) = Total Time (seconds) / 3600
+**determine start time**
+Operation Start = MAX(
+           Machine Available Time,    // When machine is free
+           Previous Step Completion   // When previous step finishes
+       )
+**determine end**
+Operation End = Operation Start + Total Time (hours)
+
+- **Update Availability:**
+   - Machine marked as unavailable until `Operation End`
+   - Batch marked as waiting until `Operation End` (before next step)
+
+Key points to note:
+Batches don't run in parallel; they queue on machines
+Each machine processes batches sequentially
+This creates a linear scheduling model

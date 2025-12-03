@@ -1,0 +1,37 @@
+| Category                      | Tools / Libraries                     |
+| ----------------------------- | ------------------------------------- |
+| **Core Language**             | Python                                |
+| **Data Libraries**            | Pandas, SQLAlchemy                    |
+| **Optimization**              | Pyomo, PuLP, OR-Tools                 |
+| **Database**                  | SQLite (POC), PostgreSQL (Production) |
+| **UI / Visualization**        | Streamlit, Plotly, Matplotlib         |
+| **Reporting**                 | Power BI                              |
+| **Version Control**           | Git, GitHub                           |
+| **Optional Simulation**       | SimPy                                 |
+| **Solvers**                   | CBC, GLPK, Gurobi, CPLEX              |
+| **Optional UI Tech (Future)** | React.js, Tailwind CSS                |
+
+
+Machines, operators, process steps, setup times
+Product routing and quality rates
+Weekly production demand (EDIs)
+Buffer and material availability
+
+Line balancing and bottleneck detection
+Production Schedule(Time-based schedule per machine)
+Gantt Charts
+Minimizing setups/tool changes
+Batch and buffer size optimization
+
+
+| Category                       | Example Fields                                                                                                         |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+|Resources (Machines)            | `Machine_ID`, `Machine_Name`, `Cycle_Time`, `Setup_Time`, `Available_Hours`, `Efficiency`, `Tool_Change_Time`          |
+|Operators                       | `Operator_ID`, `Name`, `Skill_Level`, `Shift_Time`, `Availability`, `Max_Hours_Per_Day`                                |
+|Process Steps / Product Routing | `Product_ID`, `Process_Step`, `Required_Machine`, `Cycle_Time`, `Precedence_Order`                                     |
+|Product Variants                | `Product_Code`, `Variant_Name`, `Demand_Qty`                                                                           |
+|Constraints                     | `Available_Time_Per_Machine`, `Available_Time_Per_Operator`, `Tool_Change_Time`, `Shift_Length`, `Max_Buffer_Capacity` |
+|Production Demand (Forecast)    | `Week_No`, `Product_ID`, `Demand_Qty`, `Due_Date`                                                                      |
+|Quality / Rework Rates          | `Process_ID`, `Quality_Rate`, `Rework_Time`                                                                            |
+|Buffers & Materials             | `Station_ID`, `Buffer_Size`, `Material_Availability`, `Feeding_Time`                                                   |
+

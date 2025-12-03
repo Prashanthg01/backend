@@ -1,0 +1,54 @@
++---------------------------+
+|         PRODUCTS          |
++---------------------------+
+| id (PK)                   |
+| item (unique)             |
+| sap_tn                    |
+| sap_pl                    |
+| dcc_type                  |
+| description               |
+| demand_2024               |
+| batch_size                |
+| num_batches               |
+| created_at                |
+| updated_at                |
++---------------------------+
+           ^
+           | (FK: product_id)
+           |
++---------------------------+
+|       PROCESS_STEPS       |
++---------------------------+
+| id (PK)                   |
+| product_id (FK) -----------+
+| step_number               |
+| machine_id (FK) ----------+
+| step_name                 |
+| cycle_time_seconds        |
+| workers_required          |
+| created_at                |
+| updated_at                |
++---------------------------+
+           ^         ^
+           |         |
+           |         | (FK: machine_id)
+           |         |
+           |         +----------------------+
+           |                                |
+           |                                |
++---------------------------+       +---------------------------+
+|  PRODUCTION_SCHEDULES     |       |         MACHINES          |
++---------------------------+       +---------------------------+
+| id (PK)                   |       | id (PK)                   |
+| machine_id (FK) ----------+------>| name (unique)             |
+| product_id (FK) ----------+-----> | available_hours_per_day   |
+| process_step_id (FK) -----+       | created_at                |
+| batch_id                  |       | updated_at                |
+| batch_num                 |       +---------------------------+
+| batch_size                |
+| start_time                |
+| end_time                  |
+| duration_hours            |
+| created_at                |
+| updated_at                |
++---------------------------+
