@@ -1,14 +1,14 @@
-OptiFrameY - Project Setup Guide
-================================
+OptiFrameY Project
+=================
 
 Python Version
 --------------
 Python 3.11.0
 
 
-================================
-HOW TO RUN THE BACKEND
-================================
+=================================
+HOW TO RUN THE BACKEND (Django)
+=================================
 
 1. Open the project root folder:
    OptiFrameY
@@ -22,16 +22,27 @@ HOW TO RUN THE BACKEND
 4. Install required dependencies:
    pip install -r requirements.txt
 
-5. Start the Django development server:
+5. Create a Django superuser:
+   python manage.py createsuperuser
+
+   You will be prompted to enter:
+   - Username
+   - Email
+   - Password
+
+6. Run the backend server:
    python manage.py runserver
 
-6. The backend will be available at:
+7. Backend will be available at:
    http://127.0.0.1:8000/
 
+8. Access the Django Admin Panel at:
+   http://127.0.0.1:8000/admin/
 
-================================
-HOW TO RUN THE FRONTEND
-================================
+
+=================================
+HOW TO RUN THE FRONTEND (Streamlit)
+=================================
 
 1. Open the project root folder:
    OptiFrameY
@@ -45,12 +56,10 @@ HOW TO RUN THE FRONTEND
 4. Run the Streamlit application:
    streamlit run app.py
 
-5. The frontend will open automatically in your browser.
 
-
-================================
+=================================
 NOTES
-================================
-- Ensure Python 3.11.0 is installed before starting.
-- Always activate the virtual environment before running backend or frontend.
-- Backend must be running for full functionality of the frontend.
+=================================
+- Ensure Python 3.11.0 is installed before running the project.
+- Always activate the virtual environment before running backend or frontend services.
+- Make sure all dependencies are installed successfully to avoid runtime errors.
