@@ -1,0 +1,63 @@
+----------------------------------- How batch split is Taken -------------------------------------
+demand = 1141
+batch_size = demand / 12 = 95.0833333
+
+----------------------------------- How duration_hours is Calculated -----------------------------
+batch_size = 102
+cycle_time_seconds = 8.12
+total_time_sec = 8.12 × 102 = 828.24 seconds
+duration_hours = 828.24 / 3600 = 0.2301 hours
+
+Formula:
+duration_hours = (cycle_time_seconds × batch_size) / 3600
+
+------------------------------------
+
+What is the goal of line balancing?
+Balance per machine
+Balance per routing(balance steps)
+Balance whole plant(balancing load across all machines.)
+
+Do you want bottleneck detection per product or per machine?
+Do you want buffer size per step or per machine?
+
+
+----------------------------------- Bottleneck detection ----------------------------------------
+used_hours[m] = sum of duration_hours for schedules on machine m.
+makespan_hours = max(end_time) − min(start_time) in hours.
+utilization[m] = used_hours[m] / makespan_hours
+
+Sort machines by utilization. Then  Highest utilization → bottleneck.
+
+------------------------------------- Line balancing -------------------------------------------
+
+
+-------------------------------------- Batch-size optimization --------------------------------
+
+what is max_num_batches we can go upto ?
+(update in UI)
+-------------------------------------- Buffer Size Optimization ----------------------------
+
+throughput_per_hour = total_units_produced / makespan_hours.
+m is machine
+expected_delay_hours_at_m is average operation time on machine
+
+
+buffer_m_units = throughput_per_hour * expected_delay_hours_at_m * safety_factor
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
