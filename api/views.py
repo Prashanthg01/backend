@@ -2,6 +2,7 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 import pandas as pd
 import numpy as np
+from django.db.models import Sum, Count, Q, Max, Min, Avg
 
 
 @api_view(['POST'])
@@ -249,9 +250,14 @@ from .serializers import (
 @api_view(['POST'])
 def generate_schedule(request):
     """
-    Generate production schedule based on products and process steps
+    Generate production schedule with optimized batch sizes
     """
     try:
+        # Get batch optimization parameters
+        max_num_batches = int(request.data.get('max_num_batches', 25))
+        min_batch_size = int(request.data.get('min_batch_size', 50))
+        max_batch_size = int(request.data.get('max_batch_size', 500))
+        
         # Clear existing schedules
         ProductionSchedule.objects.all().delete()
         
@@ -262,6 +268,30 @@ def generate_schedule(request):
             return Response({
                 'error': 'No products with demand found'
             }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Update products with optimized batch sizes
+        batch_optimization_log = []
+        
+        for product in products:
+            batch_size, num_batches, ideal_batch = calculate_optimal_batch_size(
+                product.demand_2024,
+                max_num_batches,
+                min_batch_size,
+                max_batch_size
+            )
+            
+            # Update product
+            product.batch_size = batch_size
+            product.num_batches = num_batches
+            product.save()
+            
+            batch_optimization_log.append({
+                'item': product.item,
+                'demand': product.demand_2024,
+                'batch_size': batch_size,
+                'num_batches': num_batches,
+                'ideal_batch_size': round(ideal_batch, 2)
+            })
         
         # Initialize tracking variables
         machine_availability = {}
@@ -364,14 +394,23 @@ def generate_schedule(request):
         return Response({
             'message': f'Schedule generated successfully with {total_schedules} operations',
             'kpis': kpis,
-            'schedule_count': total_schedules
+            'schedule_count': total_schedules,
+            'batch_optimization': {
+                'parameters': {
+                    'max_num_batches': max_num_batches,
+                    'min_batch_size': min_batch_size,
+                    'max_batch_size': max_batch_size
+                },
+                'products_optimized': len(batch_optimization_log),
+                'sample_optimizations': batch_optimization_log[:5]  # First 5 as sample
+            }
         }, status=status.HTTP_201_CREATED)
         
     except Exception as e:
         return Response({
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
+    
 
 @api_view(['GET'])
 def get_schedule(request):
@@ -448,7 +487,7 @@ def get_filter_options(request):
 @api_view(['GET'])
 def get_kpis(request):
     """
-    Get KPI metrics
+    Get KPI metrics with bottleneck detection
     """
     try:
         schedules = ProductionSchedule.objects.all()
@@ -464,7 +503,7 @@ def get_kpis(request):
         makespan_hours = (max_end - min_start).total_seconds() / 3600
         makespan_days = makespan_hours / 24
         
-        # Machine utilization
+        # Machine utilization and bottleneck detection
         machines = Machine.objects.all()
         machine_stats = []
         
@@ -483,21 +522,36 @@ def get_kpis(request):
                 'num_operations': num_operations
             })
         
+        # Sort by utilization to identify bottleneck
+        machine_stats_sorted = sorted(machine_stats, key=lambda x: x['utilization'], reverse=True)
+        
+        # Identify bottleneck (highest utilization)
+        bottleneck = None
+        if machine_stats_sorted:
+            bottleneck = {
+                'machine': machine_stats_sorted[0]['machine'],
+                'utilization': machine_stats_sorted[0]['utilization'],
+                'used_hours': machine_stats_sorted[0]['used_hours']
+            }
+        
         # Throughput
         total_units = Product.objects.filter(demand_2024__gt=0).aggregate(
             total=Sum('demand_2024')
         )['total'] or 0
         throughput_per_day = (total_units / makespan_days) if makespan_days > 0 else 0
+        throughput_per_hour = (total_units / makespan_hours) if makespan_hours > 0 else 0
         
-        # Number of setups (count of operations)
+        # Number of setups
         num_setups = schedules.count()
         
         return Response({
             'total_makespan_hours': round(makespan_hours, 2),
             'total_makespan_days': round(makespan_days, 2),
-            'machine_utilization': machine_stats,
+            'machine_utilization': machine_stats_sorted,
+            'bottleneck': bottleneck,
             'total_operations': num_setups,
             'throughput_units_per_day': round(throughput_per_day, 2),
+            'throughput_units_per_hour': round(throughput_per_hour, 2),
             'total_units_scheduled': total_units
         }, status=status.HTTP_200_OK)
         
@@ -506,13 +560,17 @@ def get_kpis(request):
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-
 @api_view(['POST'])
 def initialize_data(request):
     """
     Initialize database with sample data
     """
     try:
+        # Get batch optimization parameters
+        max_num_batches = int(request.data.get('max_num_batches', 25))
+        min_batch_size = int(request.data.get('min_batch_size', 50))
+        max_batch_size = int(request.data.get('max_batch_size', 500))
+        
         # Clear existing data
         Product.objects.all().delete()
         Machine.objects.all().delete()
@@ -534,7 +592,6 @@ def initialize_data(request):
             )
             machines[machine_name] = machine
         
-        # Product data
         # Product data
         demand_data = {
             'Item': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 39, 40, 46, 47, 48, 49, 50, 51, 55, 56, 58, 59],
@@ -584,150 +641,77 @@ def initialize_data(request):
 
         # Process routing
         process_routing = [
-            # Item 1 - 4 Wire Jacket 2xDCC Modul 9Y4251
             {'item': 1, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.30, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 2 - 6 Wire Jacket 2xDCC Modul 9Y4251A
             {'item': 2, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.29, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 3 - 6 Wire Jacket 3xDCC Modul 9Y4252
             {'item': 3, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.19, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 4 - 6 Wire Jacket 3xDCC Modul 9Y4255
             {'item': 4, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.26, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 5 - Twisted Wires 1xDCC Modul 9Y4279 AA,AB,AC (30°)
             {'item': 5, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.18, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 6 - Twisted Wires 1xDCC Modul 9Y4279 AD,AE,AF (60°)
             {'item': 6, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.30, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 7 - Twisted Wires 1xDCC Modul 9Y4279 AA,AD (60°)
             {'item': 7, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.29, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 8 - Twisted Wires 1xDCC Modul 9Y4279 AB,AC,AE,AF (60°)
             {'item': 8, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.26, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 9 - Twisted Wires 1xDCC Modul 9Y4279 AA,AD (180°)
             {'item': 9, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.19, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 10 - Twisted Wires 1xDCC Modul 9Y4279 AB,AC,AE,AF (180°)
             {'item': 10, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.22, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 11 - Twisted Wires 1xDCC Modul 9Y4286 M,N (60°)
             {'item': 11, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.13, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 12 - Twisted Wires 1xDCC Modul 9Y4286 M,N (90°B)
             {'item': 12, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.15, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 13 - Twisted Wires 1xDCC Modul 9Y4286 P,Q (90°)
             {'item': 13, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.18, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 14 - Twisted Wires 1xDCC Modul 9Y4286 P,Q (90°)
             {'item': 14, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.95, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
             {'item': 14, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 15 - Twisted Wires 1xDCC Modul 9Y4286 N,Q (60°)
             {'item': 15, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.95, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
             {'item': 15, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 12.00, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 16 - Twisted Wires 1xDCC Modul 9Y4286 M,P (60°)
             {'item': 16, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.92, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
             {'item': 16, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 12.00, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 17 - Twisted Wires 1xDCC Modul 9Y4286 M,P (180°)
             {'item': 17, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.95, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
             {'item': 17, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 12.00, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 18 - Twisted Wires 1xDCC Modul 9Y4286 N,Q (180°)
             {'item': 18, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.92, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
             {'item': 18, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 12.00, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 19 - Twisted Wires 1xDCC Modul 512 AC, 513 AC (180°)
             {'item': 19, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.69, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 20 - Twisted Wires 1xDCC Modul 512, 513 (180°)
             {'item': 20, 'step': 2, 'machine': 'Alpha 550 / Alpha 433', 'time': 3.22, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 21 - Twisted Wires 1xDCC Modul 510 AB,BB (90°)
             {'item': 21, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.31, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 22 - Twisted Wires 1xDCC Modul 511 AB,BB (90°)
             {'item': 22, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.19, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 23 - Twisted Wires 1xDCC Modul 511 AB,BB (90°)
             {'item': 23, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.19, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 24 - 4 Wire Jacket 2xDCC Modul 511 BB (180° & 90°B)
             {'item': 24, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.59, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            
-            # Item 25 - 7 Wire Jacket 2xDCC Modul 511 A9 (180° & 90°B)
             {'item': 25, 'step': 7, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.82, 'name': 'Cutting Stripping Jacket Cable 7-Wire', 'workers': 0.5},
             {'item': 25, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 26 - 4 Wire Jacket 1xDCC Modul 510 BB (180°)
             {'item': 26, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.54, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            
-            # Item 27 - 4 Wire Jacket 1xDCC Modul 510 AB (180°)
             {'item': 27, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.82, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
             {'item': 27, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 28 - 4 Wire Jacket 2xDCC Modul T3-512 AA (180°)
             {'item': 28, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 7.43, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
-            
-            # Item 29 - 4 Wire Jacket 2xDCC Modul T3-513 AA (60°)
             {'item': 29, 'step': 7, 'machine': 'Kappa 350 / Kappa 330', 'time': 7.50, 'name': 'Cutting Stripping Jacket Cable 7-Wire', 'workers': 0.5},
             {'item': 29, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 12.00, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 30 - 4 Wire Jacket 2xDCC Modul T3-513 AA (180°)
             {'item': 30, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.34, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
             {'item': 30, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 31 - 4 Wire Jacket 2xDCC Modul T3-511 AA (60° & 90°)
             {'item': 31, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.45, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
             {'item': 31, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 32 - 4 Wire Jacket 2xDCC Modul T3-x11 AA (180°)
             {'item': 32, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.45, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
             {'item': 32, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 33 - 4 Wire Jacket 2xDCC Modul T3-x11 AA (60° & 90°)
             {'item': 33, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.30, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
             {'item': 33, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 34 - Twisted Wires 1xDCC Modul T3-x13 AA (60° & 90°)
             {'item': 34, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.61, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 35 - Twisted Wires 1xDCC Modul T1-513 AA (60°)
             {'item': 35, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.61, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 36 - Single Wires 1xDCC Modul T3-x12 AA (180°)
             {'item': 36, 'step': 2, 'machine': 'Alpha 550 / Alpha 433', 'time': 3.30, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            
-            # Item 37 - 4 Wire Jacket 1xDCC Modul 963004 _A (60°)
             {'item': 37, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.54, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
             {'item': 37, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 38 - 4 Wire Jacket 1xDCC Modul 963004 _B (60°)
             {'item': 38, 'step': 7, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.53, 'name': 'Cutting Stripping Jacket Cable 7-Wire', 'workers': 0.5},
             {'item': 38, 'step': 9, 'machine': 'Kappa 350 / Kappa 330', 'time': 16.00, 'name': 'Cutting Stripping Jacket Cable 9-Wire', 'workers': 0.5},
-            
-            # Item 39 - 4 Wire Jacket 1xDCC Modul 963002 (60°)
             {'item': 39, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.68, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
             {'item': 39, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 40 - 4 Wire Jacket 1xDCC Modul 963001 (60°)
             {'item': 40, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.33, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
             {'item': 40, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            
-            # Item 41 - Twisted Wires 1xDCC Modul 9J0, 9J1 HL (180°)
             {'item': 41, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.90, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5}
         ]
         
-        # Create products and process steps
+        # Create products and process steps with optimized batch sizes
         for i in range(len(demand_data['Item'])):
             item = demand_data['Item'][i]
-            batch_size = int(np.ceil(demand_data['Demand_2024'][i] / 12))
+            demand = demand_data['Demand_2024'][i]
+            
+            if demand is None or demand <= 0:
+                continue
+            
+            # Calculate optimal batch size
+            batch_size, num_batches, ideal_batch = calculate_optimal_batch_size(
+                demand, max_num_batches, min_batch_size, max_batch_size
+            )
             
             product = Product.objects.create(
                 item=item,
@@ -735,9 +719,9 @@ def initialize_data(request):
                 sap_pl=str(demand_data['SAP_PL'][i]) if demand_data['SAP_PL'][i] else None,
                 dcc_type=demand_data['DCC_Type'][i],
                 description=demand_data['Description'][i],
-                demand_2024=demand_data['Demand_2024'][i],
+                demand_2024=demand,
                 batch_size=batch_size,
-                num_batches=12
+                num_batches=num_batches
             )
             
             # Add process steps for this product
@@ -756,12 +740,326 @@ def initialize_data(request):
         machine_count = Machine.objects.count()
         step_count = ProcessStep.objects.count()
         
+        # Calculate average batch size
+        products = Product.objects.filter(demand_2024__gt=0)
+        avg_batch_size = products.aggregate(avg=Avg('batch_size'))['avg'] or 0
+        
         return Response({
-            'message': 'Database initialized successfully',
+            'message': 'Database initialized successfully with optimized batch sizes',
             'products_created': product_count,
             'machines_created': machine_count,
-            'process_steps_created': step_count
+            'process_steps_created': step_count,
+            'batch_optimization': {
+                'parameters': {
+                    'max_num_batches': max_num_batches,
+                    'min_batch_size': min_batch_size,
+                    'max_batch_size': max_batch_size
+                },
+                'avg_batch_size': round(avg_batch_size, 2)
+            }
         }, status=status.HTTP_201_CREATED)
+        
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    
+@api_view(['GET'])
+def get_buffer_optimization(request):
+    """
+    Calculate optimal buffer sizes for each machine
+    """
+    try:
+        schedules = ProductionSchedule.objects.all()
+        
+        if not schedules.exists():
+            return Response({
+                'message': 'No schedules available'
+            }, status=status.HTTP_200_OK)
+        
+        # Get safety factor from request (default 1.5)
+        safety_factor = float(request.GET.get('safety_factor', 1.5))
+        
+        # Calculate makespan and throughput
+        min_start = schedules.aggregate(Min('start_time'))['start_time__min']
+        max_end = schedules.aggregate(Max('end_time'))['end_time__max']
+        makespan_hours = (max_end - min_start).total_seconds() / 3600
+        
+        total_units = Product.objects.filter(demand_2024__gt=0).aggregate(
+            total=Sum('demand_2024')
+        )['total'] or 0
+        
+        throughput_per_hour = (total_units / makespan_hours) if makespan_hours > 0 else 0
+        
+        # Calculate buffer for each machine
+        machines = Machine.objects.all()
+        buffer_recommendations = []
+        
+        for machine in machines:
+            # Get average operation time (expected delay) for this machine
+            machine_schedules = schedules.filter(machine=machine)
+            
+            if machine_schedules.exists():
+                avg_duration_hours = machine_schedules.aggregate(
+                    avg=Avg('duration_hours')
+                )['avg'] or 0
+                
+                # Calculate buffer size
+                # buffer = throughput_per_hour × expected_delay_hours × safety_factor
+                buffer_units = throughput_per_hour * avg_duration_hours * safety_factor
+                
+                # Get total operations and utilization
+                total_operations = machine_schedules.count()
+                used_hours = machine_schedules.aggregate(
+                    total=Sum('duration_hours')
+                )['total'] or 0
+                utilization = (used_hours / makespan_hours * 100) if makespan_hours > 0 else 0
+                
+                buffer_recommendations.append({
+                    'machine': machine.name,
+                    'buffer_size_units': round(buffer_units, 2),
+                    'avg_operation_time_hours': round(avg_duration_hours, 4),
+                    'throughput_per_hour': round(throughput_per_hour, 2),
+                    'safety_factor': safety_factor,
+                    'utilization': round(utilization, 2),
+                    'total_operations': total_operations,
+                    'recommendation': 'HIGH PRIORITY' if utilization > 80 else 'MEDIUM PRIORITY' if utilization > 60 else 'LOW PRIORITY'
+                })
+        
+        # Sort by buffer size (descending) - machines needing larger buffers first
+        buffer_recommendations_sorted = sorted(
+            buffer_recommendations, 
+            key=lambda x: x['buffer_size_units'], 
+            reverse=True
+        )
+        
+        return Response({
+            'buffer_recommendations': buffer_recommendations_sorted,
+            'parameters': {
+                'throughput_per_hour': round(throughput_per_hour, 2),
+                'makespan_hours': round(makespan_hours, 2),
+                'safety_factor': safety_factor,
+                'total_units': total_units
+            },
+            'formula': 'buffer_units = throughput_per_hour × avg_operation_time_hours × safety_factor'
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+def get_bottleneck_analysis(request):
+    """
+    Detailed bottleneck analysis with recommendations
+    """
+    try:
+        schedules = ProductionSchedule.objects.all()
+        
+        if not schedules.exists():
+            return Response({
+                'message': 'No schedules available'
+            }, status=status.HTTP_200_OK)
+        
+        # Calculate makespan
+        min_start = schedules.aggregate(Min('start_time'))['start_time__min']
+        max_end = schedules.aggregate(Max('end_time'))['end_time__max']
+        makespan_hours = (max_end - min_start).total_seconds() / 3600
+        
+        # Analyze each machine
+        machines = Machine.objects.all()
+        bottleneck_analysis = []
+        
+        for machine in machines:
+            machine_schedules = schedules.filter(machine=machine)
+            
+            if machine_schedules.exists():
+                used_hours = machine_schedules.aggregate(
+                    total=Sum('duration_hours')
+                )['total'] or 0
+                
+                utilization = (used_hours / makespan_hours * 100) if makespan_hours > 0 else 0
+                num_operations = machine_schedules.count()
+                
+                avg_operation_time = machine_schedules.aggregate(
+                    avg=Avg('duration_hours')
+                )['avg'] or 0
+                
+                # Idle time
+                idle_hours = makespan_hours - used_hours
+                idle_percentage = (idle_hours / makespan_hours * 100) if makespan_hours > 0 else 0
+                
+                # Get products processed on this machine
+                products_on_machine = machine_schedules.values_list(
+                    'product__item', flat=True
+                ).distinct().count()
+                
+                # Determine bottleneck status
+                if utilization >= 85:
+                    status_label = 'CRITICAL BOTTLENECK'
+                    recommendation = 'Consider adding capacity, optimizing setups, or redistributing work'
+                elif utilization >= 70:
+                    status_label = 'POTENTIAL BOTTLENECK'
+                    recommendation = 'Monitor closely, consider process improvements'
+                elif utilization >= 50:
+                    status_label = 'WELL UTILIZED'
+                    recommendation = 'Operating efficiently'
+                else:
+                    status_label = 'UNDERUTILIZED'
+                    recommendation = 'Opportunity to consolidate operations or reduce capacity'
+                
+                bottleneck_analysis.append({
+                    'machine': machine.name,
+                    'utilization': round(utilization, 2),
+                    'used_hours': round(used_hours, 2),
+                    'idle_hours': round(idle_hours, 2),
+                    'idle_percentage': round(idle_percentage, 2),
+                    'num_operations': num_operations,
+                    'avg_operation_time_hours': round(avg_operation_time, 4),
+                    'products_processed': products_on_machine,
+                    'status': status_label,
+                    'recommendation': recommendation
+                })
+        
+        # Sort by utilization (highest first)
+        bottleneck_analysis_sorted = sorted(
+            bottleneck_analysis, 
+            key=lambda x: x['utilization'], 
+            reverse=True
+        )
+        
+        # Overall summary
+        summary = {
+            'total_makespan_hours': round(makespan_hours, 2),
+            'bottleneck_machine': bottleneck_analysis_sorted[0]['machine'] if bottleneck_analysis_sorted else None,
+            'bottleneck_utilization': bottleneck_analysis_sorted[0]['utilization'] if bottleneck_analysis_sorted else 0,
+            'avg_utilization': round(np.mean([m['utilization'] for m in bottleneck_analysis]), 2) if bottleneck_analysis else 0,
+            'total_machines': len(bottleneck_analysis)
+        }
+        
+        return Response({
+            'summary': summary,
+            'machine_analysis': bottleneck_analysis_sorted
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+def calculate_optimal_batch_size(demand, max_num_batches=25, min_batch_size=50, max_batch_size=500):
+    """
+    Calculate optimal batch size based on demand
+    
+    Args:
+        demand: Total demand for the product
+        max_num_batches: Maximum number of batches allowed
+        min_batch_size: Minimum size per batch
+        max_batch_size: Maximum size per batch
+    
+    Returns:
+        tuple: (batch_size, num_batches, avg_batch_size_used)
+    """
+    if demand <= 0:
+        return 0, 0, 0
+    
+    # Calculate ideal batch size
+    ideal_batch_size = demand / max_num_batches
+    
+    # Adjust based on constraints
+    if ideal_batch_size < min_batch_size:
+        # If ideal is too small, use min_batch_size
+        batch_size = min_batch_size
+        num_batches = int(np.ceil(demand / batch_size))
+    elif ideal_batch_size > max_batch_size:
+        # If ideal is too large, use max_batch_size
+        batch_size = max_batch_size
+        num_batches = int(np.ceil(demand / batch_size))
+    else:
+        # Use a balanced approach
+        # Try to get batch size close to ideal while keeping reasonable number of batches
+        num_batches = max(1, int(np.ceil(demand / ideal_batch_size)))
+        batch_size = int(np.ceil(demand / num_batches))
+    
+    # Ensure we don't exceed max_num_batches
+    if num_batches > max_num_batches:
+        num_batches = max_num_batches
+        batch_size = int(np.ceil(demand / num_batches))
+    
+    return batch_size, num_batches, ideal_batch_size
+
+
+@api_view(['GET'])
+def get_batch_optimization_preview(request):
+    """
+    Preview batch size optimization for all products
+    """
+    try:
+        max_num_batches = int(request.GET.get('max_num_batches', 25))
+        min_batch_size = int(request.GET.get('min_batch_size', 50))
+        max_batch_size = int(request.GET.get('max_batch_size', 500))
+        
+        products = Product.objects.filter(demand_2024__gt=0)
+        
+        batch_analysis = []
+        total_demand = 0
+        total_batches = 0
+        batch_sizes = []
+        
+        for product in products:
+            demand = product.demand_2024
+            
+            # Calculate optimal batch size
+            batch_size, num_batches, ideal_batch = calculate_optimal_batch_size(
+                demand, max_num_batches, min_batch_size, max_batch_size
+            )
+            
+            # Old method (fixed 12 batches)
+            old_batch_size = int(np.ceil(demand / 12))
+            old_num_batches = 12
+            
+            batch_analysis.append({
+                'item': product.item,
+                'description': product.description[:50],
+                'demand': demand,
+                'old_batch_size': old_batch_size,
+                'old_num_batches': old_num_batches,
+                'new_batch_size': batch_size,
+                'new_num_batches': num_batches,
+                'ideal_batch_size': round(ideal_batch, 2),
+                'improvement': f"{((old_num_batches - num_batches) / old_num_batches * 100):.1f}%" if old_num_batches != num_batches else "0%"
+            })
+            
+            total_demand += demand
+            total_batches += num_batches
+            batch_sizes.append(batch_size)
+        
+        # Calculate statistics
+        avg_batch_size = np.mean(batch_sizes) if batch_sizes else 0
+        min_batch = np.min(batch_sizes) if batch_sizes else 0
+        max_batch = np.max(batch_sizes) if batch_sizes else 0
+        std_batch = np.std(batch_sizes) if batch_sizes else 0
+        
+        return Response({
+            'batch_analysis': batch_analysis,
+            'summary': {
+                'total_products': len(batch_analysis),
+                'total_demand': total_demand,
+                'total_batches': total_batches,
+                'avg_batch_size': round(avg_batch_size, 2),
+                'min_batch_size': min_batch,
+                'max_batch_size': max_batch,
+                'std_batch_size': round(std_batch, 2)
+            },
+            'parameters': {
+                'max_num_batches': max_num_batches,
+                'min_batch_size': min_batch_size,
+                'max_batch_size': max_batch_size
+            }
+        }, status=status.HTTP_200_OK)
         
     except Exception as e:
         return Response({
