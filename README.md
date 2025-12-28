@@ -6,9 +6,9 @@ Python Version
 Python 3.11.0
 
 
-=================================
-HOW TO RUN THE BACKEND (Django)
-=================================
+=====================
+HOW TO RUN BACKEND
+=====================
 
 1. Open the project root folder:
    OptiFrameY
@@ -22,7 +22,7 @@ HOW TO RUN THE BACKEND (Django)
 4. Install required dependencies:
    pip install -r requirements.txt
 
-5. Create a Django superuser:
+5. Create a superuser (for admin access):
    python manage.py createsuperuser
 
    You will be prompted to enter:
@@ -30,19 +30,23 @@ HOW TO RUN THE BACKEND (Django)
    - Email
    - Password
 
-6. Run the backend server:
+6. Apply database migrations:
+   python manage.py makemigrations
+   python manage.py migrate
+
+7. Run the backend server:
    python manage.py runserver
 
-7. Backend will be available at:
+8. Backend will be available at:
    http://127.0.0.1:8000/
 
-8. Access the Django Admin Panel at:
+9. Admin panel can be accessed at:
    http://127.0.0.1:8000/admin/
 
 
-=================================
-HOW TO RUN THE FRONTEND (Streamlit)
-=================================
+=====================
+HOW TO RUN FRONTEND
+=====================
 
 1. Open the project root folder:
    OptiFrameY
@@ -57,9 +61,9 @@ HOW TO RUN THE FRONTEND (Streamlit)
    streamlit run app.py
 
 
-=================================
+=====================
 NOTES
-=================================
+=====================
 - Ensure Python 3.11.0 is installed before running the project.
-- Always activate the virtual environment before running backend or frontend services.
-- Make sure all dependencies are installed successfully to avoid runtime errors.
+- Make sure the virtual environment is activated before running any commands.
+- Backend must be running for frontend features that depend on APIs.

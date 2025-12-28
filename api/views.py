@@ -3,210 +3,82 @@ from rest_framework.response import Response
 import pandas as pd
 import numpy as np
 from django.db.models import Sum, Count, Q, Max, Min, Avg
-
+from .utils import clean_numeric_columns, clean_text_columns, apply_filters, clean_shift_columns, calculate_efficiency, calculate_backlog, calculate_production_outputs, SHIFT_LABELS, build_summary
 
 @api_view(['POST'])
 def process_csv(request):
+    """
+    Process a production planning CSV file and return shift-wise metrics.
+
+    This API accepts a CSV upload along with optional filter parameters
+    (PPS TN, Project, Sub-Project, Machine, Tool No., Area). It performs
+    data cleaning, filtering, and computes:
+
+    - Shift-wise production output (Finished Goods & Connectors)
+    - Shift-wise backlog (Finished Goods)
+    - Shift-wise overall efficiency (%)
+    - A summary table of planned vs realized output and backlog status
+
+    Request Parameters:
+    -------------------
+    file : CSV file (required)
+    num_shifts : int (optional, default=28)
+    pps_tn, project, sub_project, machine, tool_no, area : str (optional)
+
+    Response:
+    --------
+    JSON object with:
+      - ShiftWise metrics
+      - Summary table
+    """
+
     csv_file = request.FILES.get('file')
     if not csv_file:
         return Response({'error': 'No file uploaded'}, status=400)
 
     num_shifts = int(request.POST.get("num_shifts", 28))
-    
-    # Get filter parameters
-    filter_pps_tn = request.POST.get("pps_tn", "All")
-    filter_project = request.POST.get("project", "All")
-    filter_sub_project = request.POST.get("sub_project", "All")
-    filter_machine = request.POST.get("machine", "All")
-    filter_tool_no = request.POST.get("tool_no", "All")
-    filter_area = request.POST.get("area", "All")
-    
-    # Read CSV
     df = pd.read_csv(csv_file)
 
-    # Clean numeric columns
-    numeric_cols = ['Planned', 'Realized', 'Backlog', 'Open']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '').str.strip(), errors='coerce')
+    clean_numeric_columns(df, ['Planned', 'Realized', 'Backlog', 'Open'])
+    clean_text_columns(df, ['Step', 'Area', 'Sub-Project'])
+    clean_text_columns(df, ['PPS TN', 'Project', 'Sub-Project', 'Machine', 'Tool No.', 'Area'])
 
-    # Clean text columns
-    df['Step'] = df['Step'].astype(str).str.strip()
-    df['Area'] = df['Area'].astype(str).str.strip()
-    df['Sub-Project'] = df['Sub-Project'].astype(str).str.strip()
-    
-    # Clean filter columns if they exist
-    filter_columns = ['PPS TN', 'Project', 'Sub-Project', 'Machine', 'Tool No.', 'Area']
-    for col in filter_columns:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
+    df = apply_filters(df, {
+        'PPS TN': request.POST.get("pps_tn", "All"),
+        'Project': request.POST.get("project", "All"),
+        'Sub-Project': request.POST.get("sub_project", "All"),
+        'Machine': request.POST.get("machine", "All"),
+        'Tool No.': request.POST.get("tool_no", "All"),
+        'Area': request.POST.get("area", "All"),
+    })
 
-    # Apply filters
-    if filter_pps_tn != "All" and 'PPS TN' in df.columns:
-        df = df[df['PPS TN'] == filter_pps_tn]
-    
-    if filter_project != "All" and 'Project' in df.columns:
-        df = df[df['Project'] == filter_project]
-    
-    if filter_sub_project != "All" and 'Sub-Project' in df.columns:
-        df = df[df['Sub-Project'] == filter_sub_project]
-    
-    if filter_machine != "All" and 'Machine' in df.columns:
-        df = df[df['Machine'] == filter_machine]
-    
-    if filter_tool_no != "All" and 'Tool No.' in df.columns:
-        df = df[df['Tool No.'] == filter_tool_no]
-    
-    if filter_area != "All" and 'Area' in df.columns:
-        df = df[df['Area'] == filter_area]
+    clean_shift_columns(df, [(14, 50), (95, 113)])
 
-    # Filters
-    H = df['Step']
-    G = df['Area']
-    D = df['Sub-Project']
+    efficiency = calculate_efficiency(df, num_shifts)
+    backlog = calculate_backlog(df)
 
-    # Define 36 shift labels
-    shift_labels = [
-        'Shift 1', 'Shift 1 B', 'Shift 2', 'Shift 2 A', 'Shift 3', 'Shift 3 C',
-        'Shift 4', 'Shift 4 B', 'Shift 5', 'Shift 5 A', 'Shift 6', 'Shift 6 C',
-        'Shift 7', 'Shift 7 B', 'Shift 8', 'Shift 8 A', 'Shift 9', 'Shift 9 C',
-        'Shift 10', 'Shift 10 B', 'Shift 11', 'Shift 11 A', 'Shift 12', 'Shift 12 C',
-        'Shift 13', 'Shift 13 B', 'Shift 14', 'Shift 14 A', 'Shift 15', 'Shift 15 C',
-        'Shift 16', 'Shift 16 B', 'Shift 17', 'Shift 17 A', 'Shift 18', 'Shift 18 C'
-    ]
+    finished_filter = (df['Step'] == 'F') & df['Sub-Project'].notna()
+    connector_filter = (df['Area'] == 'Assembly') & df['Sub-Project'].notna()
 
-    # Clean numeric shift columns
-    for idx in range(14, 50):
-        df.iloc[:, idx] = pd.to_numeric(
-            df.iloc[:, idx].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
-            errors='coerce'
-        )
-    for idx in range(95, 113):
-        df.iloc[:, idx] = pd.to_numeric(
-            df.iloc[:, idx].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
-            errors='coerce'
-        )
+    fg_output, conn_output = calculate_production_outputs(
+        df, finished_filter, connector_filter
+    )
 
-    # Calculate Overall Efficiency
-    efficiency_list = []
-    
-    if 'STD' in df.columns:
-        std_col = df.loc[2:1003, 'STD']
-        std_col = pd.to_numeric(
-            std_col.astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
-            errors='coerce'
-        )
-        
-        quantity_col_indices = list(range(15, 52, 2))
-        shift_time_hours = 7.67
-        available_time = shift_time_hours * num_shifts
-        
-        for col_idx in quantity_col_indices:
-            quantity = df.iloc[2:1003, col_idx]
-            quantity = pd.to_numeric(
-                quantity.astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
-                errors='coerce'
-            )
-            
-            valid_mask = quantity.notna() & std_col.notna()
-            valid_quantity = quantity[valid_mask]
-            valid_std = std_col[valid_mask]
-            
-            total_planned_time_minutes = (valid_quantity * valid_std).sum()
-            total_planned_time_hours = total_planned_time_minutes / 60
-            
-            if available_time > 0:
-                efficiency = (total_planned_time_hours / available_time) * 100
-            else:
-                efficiency = 0
-            
-            efficiency_list.append(efficiency)
-    
-    # Insert 0 between each efficiency value
-    efficiency_with_zeros = []
-    for eff in efficiency_list:
-        efficiency_with_zeros.append(eff)
-        efficiency_with_zeros.append(0)
-    
-    while len(efficiency_with_zeros) < 36:
-        efficiency_with_zeros.append(0)
-    efficiency_with_zeros = efficiency_with_zeros[:36]
-
-    # Initialize result dictionary
     result = {
-        'Total Backlog Finished Goods': {},
-        'Production Output Finished Goods': {},
-        'Production Output Connectors': {},
-        'Overall Efficiency': {}
+        "Total Backlog Finished Goods": dict(zip(SHIFT_LABELS, map(str, backlog))),
+        "Production Output Finished Goods": fg_output,
+        "Production Output Connectors": conn_output,
+        "Overall Efficiency": {
+            shift: f"{eff:.2f}%" if eff > 0 else "-"
+            for shift, eff in zip(SHIFT_LABELS, efficiency)
+        },
     }
 
-    # Process backlog
-    backlog_cols = list(range(95, 113))
-    backlog_values = []
-    for col_idx in backlog_cols:
-        excel_range = df.iloc[2:264, col_idx]
-        total_backlog = excel_range.loc[excel_range > 0].sum()
-        backlog_values.append(total_backlog if total_backlog > 0 else 0)
-
-    backlog_with_zeros = []
-    for val in backlog_values:
-        backlog_with_zeros.append(val)
-        backlog_with_zeros.append(0)
-
-    while len(backlog_with_zeros) < len(shift_labels):
-        backlog_with_zeros.append(0)
-
-    for shift_label, val in zip(shift_labels, backlog_with_zeros):
-        result['Total Backlog Finished Goods'][shift_label] = f"{val:,.0f}" if val > 0 else "0"
-
-    # Filters for production outputs
-    finished_goods_filter = (H == 'F') & (D.notna()) & (D.astype(str).str.strip() != '')
-    connectors_filter = (G == 'Assembly') & (D.notna()) & (D.astype(str).str.strip() != '')
-
-    # Process production output and efficiency
-    for i, shift_label in enumerate(shift_labels):
-        col_idx = 14 + i
-        if col_idx < 50:
-            fg_value = df.iloc[:, col_idx][finished_goods_filter].sum()
-            conn_value = df.iloc[:, col_idx][connectors_filter].sum()
-            result['Production Output Finished Goods'][shift_label] = f"{fg_value:,.0f}" if fg_value > 0 else "0"
-            result['Production Output Connectors'][shift_label] = f"{conn_value:,.0f}" if conn_value > 0 else "0"
-        else:
-            result['Production Output Finished Goods'][shift_label] = "0"
-            result['Production Output Connectors'][shift_label] = "0"
-        
-        result['Overall Efficiency'][shift_label] = f"{efficiency_with_zeros[i]:.2f}%" if efficiency_with_zeros[i] > 0 else "-"
-
-    # Summary Output Table
-    total_planned_fg = df[df['Step'] == 'F']['Planned'].sum()
-    total_realized_fg = df[df['Step'] == 'F']['Realized'].sum()
-    total_planned_conn = df[df['Area'] == 'Assembly']['Planned'].sum()
-    total_realized_conn = df[df['Area'] == 'Assembly']['Realized'].sum()
-
-    current_backlog_fg = df[(df['Backlog'] > 0) & (df['Step'] == 'F')]['Backlog'].sum()
-    current_open_fg = df[df['Step'] == 'F']['Open'].sum()
-    current_backlog_conn = df[(df['Backlog'] > 0) & (df['Area'] == 'Assembly')]['Backlog'].sum()
-    current_open_conn = df[df['Area'] == 'Assembly']['Open'].sum()
-
-    summary_table = {
-        "Metric": ["Target Headcount", "Actual Headcount", "Current Backlog", "Currently Open"],
-        "Finished Goods": [
-            f"{total_planned_fg:,.0f}", f"{total_realized_fg:,.0f}",
-            f"{current_backlog_fg:,.0f}", f"{current_open_fg:,.0f}"
-        ],
-        "Connectors": [
-            f"{total_planned_conn:,.0f}", f"{total_realized_conn:,.0f}",
-            f"{current_backlog_conn:,.0f}", f"{current_open_conn:,.0f}"
-        ]
-    }
-    
-    # Final response
-    response_data = {
+    return Response({
         "ShiftWise": result,
-        "Summary": summary_table
-    }
+        "Summary": build_summary(df)
+    })
 
-    return Response(response_data)
 
 
 @api_view(['POST'])
@@ -566,11 +438,6 @@ def initialize_data(request):
     Initialize database with sample data
     """
     try:
-        # Get batch optimization parameters
-        max_num_batches = int(request.data.get('max_num_batches', 25))
-        min_batch_size = int(request.data.get('min_batch_size', 50))
-        max_batch_size = int(request.data.get('max_batch_size', 500))
-        
         # Clear existing data
         Product.objects.all().delete()
         Machine.objects.all().delete()
@@ -578,11 +445,7 @@ def initialize_data(request):
         ProductionSchedule.objects.all().delete()
         
         # Create machines
-        machines_data = [
-            'Sigma 688 / Alpha 488',
-            'Alpha 550 / Alpha 433',
-            'Kappa 350 / Kappa 330'
-        ]
+        machines_data = ['SKM Seal and outer Housing Assembly DCC', '', 'ARBURG 375ST Machine 1-5', 'Kappa 350 / Kappa 330', 'TSK T1500', 'ARBURG 375ST Machine 6-10', 'Alpha 550 / Alpha 433', 'PUR-Tube Assembly Station', 'Sigma 688 / Alpha 488', 'Cutting Automation', 'Connector Assembly Station', 'Wire Rolling & Taping Station', 'SKM DCPC Crimp (Crimp and Ass)', 'ARBURG 375ST Machine 11,12,13', 'Wire Cut & Separating Station']
         
         machines = {}
         for machine_name in machines_data:
@@ -591,127 +454,255 @@ def initialize_data(request):
                 available_hours_per_day=24
             )
             machines[machine_name] = machine
-        
-        # Product data
-        demand_data = {
-            'Item': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 39, 40, 46, 47, 48, 49, 50, 51, 55, 56, 58, 59],
-            'SAP_TN': [249313, 249314, 249316, 249316, 249078, 249079, 249080, 249081, 249082, 249083, 249084, 249085, 249086, 249087, 249088, 249089, 249090, 249091, 249092, 249093, 255164, 255166, 243866, 243867, 253644, 253651, 249102, 249103, 249108, 249109, 249110, 249111, 249115, 249116, 249118, 249119],
-            'SAP_PL': [None, None, None, None, 249043, 249044, 249045, 249046, 249047, 249048, 249049, 249050, 249051, 249052, 249053, 249054, 249055, 249056, 249057, 249058, None, None, None, None, None, None, 234300, 234594, 234316, 234317, 234607, 234608, 234310, 234311, 234602, 234603],
-            'DCC_Type': ['60° & 90°B', '60° & 90°B', '60° & 90°B', '60° & 90°B', '30°', '90°B', '90°', '60°', '60°', '60°', '180°', '180°', '30°', '90°B', '60°', '90°', '60°', '60°', '180°', '180°', '180°', '180°', '90°', '90°', '60°', '60°', '180°', '180°', '60°', '180°', '60°', '180°', '60°', '60°', '60°', '60°'],
-            'Description': [
-                '4 Wire Jacket 2xDCC Modul 9Y4251',
-                '6 Wire Jacket 2xDCC Modul 9Y4251A',
-                '6 Wire Jacket 3xDCC Modul 9Y4252',
-                '6 Wire Jacket 3xDCC Modul 9Y4255',
-                'Twisted Wires 1xDCC Modul 9Y4279 AA,AB,AC',
-                'Twisted Wires 1xDCC Modul 9Y4279 AA,AB,AC',
-                'Twisted Wires 1xDCC Modul 9Y4279 AD,AE,AF',
-                'Twisted Wires 1xDCC Modul 9Y4279 AD,AE,AF',
-                'Twisted Wires 1xDCC Modul 9Y4279 AA,AD',
-                'Twisted Wires 1xDCC Modul 9Y4279 AB,AC,AE,AF',
-                'Twisted Wires 1xDCC Modul 9Y4279 AA,AD',
-                'Twisted Wires 1xDCC Modul 9Y4279 AB,AC,AE,AF',
-                'Twisted Wires 1xDCC Modul 9Y4286 M,N',
-                'Twisted Wires 1xDCC Modul 9Y4286 M,N',
-                'Twisted Wires 1xDCC Modul 9Y4286 P,Q',
-                'Twisted Wires 1xDCC Modul 9Y4286 P,Q',
-                'Twisted Wires 1xDCC Modul 9Y4286 N,Q',
-                'Twisted Wires 1xDCC Modul 9Y4286 M,P',
-                'Twisted Wires 1xDCC Modul 9Y4286 M,P',
-                'Twisted Wires 1xDCC Modul 9Y4286 N,Q',
-                'Twisted Wires 1xDCC Modul 512 AC, 513 AC',
-                'Twisted Wires 1xDCC Modul 512, 513',
-                'Twisted Wires 1xDCC Modul 510 AB,BB',
-                'Twisted Wires 1xDCC Modul 511 AB,BB',
-                'Twisted Wires 1xDCC Modul T3-512 AA',
-                'Twisted Wires 1xDCC Modul T3-513 AA',
-                'Twisted Wires 1xDCC Modul 9J0, 9J1 HL',
-                'Twisted Wires 1xDCC Modul 9J0, 9J1 HR',
-                'Twisted Wires 1xDCC Modul 9J1286 _,C',
-                'Twisted Wires 1xDCC Modul 9J1286 _,C',
-                'Twisted Wires 1xDCC Modul 9J1286 B,E',
-                'Twisted Wires 1xDCC Modul 9J1286 B,E',
-                'Twisted Wires 1xDCC Modul 9J1206 A',
-                'Twisted Wires 1xDCC Modul 9J1206 A',
-                'Twisted Wires 1xDCC Modul 9J1206 D',
-                'Twisted Wires 1xDCC Modul 9J1206 D'
-            ],
-            'Demand_2024': [1141, 201, 1221, 1342, 1221, 1221, 120, 120, 1127, 214, 1127, 214, 1221, 1221, 120, 120, 201, 1140, 1140, 201, None, None, None, None, None, None, 14700, 14800, 12100, 12100, 12300, 12300, 2600, 2600, 2500, 2500]
-        }
 
-        # Process routing
-        process_routing = [
-            {'item': 1, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.30, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 2, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.29, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 3, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.19, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 4, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.26, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 5, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.18, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 6, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.30, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 7, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.29, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 8, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.26, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 9, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.19, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 10, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.22, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 11, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.13, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 12, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.15, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 13, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 7.18, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 14, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.95, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            {'item': 14, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 15, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.95, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
-            {'item': 15, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 12.00, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 16, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.92, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
-            {'item': 16, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 12.00, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 17, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.95, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
-            {'item': 17, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 12.00, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 18, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.92, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
-            {'item': 18, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 12.00, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 19, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.69, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 20, 'step': 2, 'machine': 'Alpha 550 / Alpha 433', 'time': 3.22, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 21, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.31, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 22, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.19, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 23, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.19, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 24, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.59, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            {'item': 25, 'step': 7, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.82, 'name': 'Cutting Stripping Jacket Cable 7-Wire', 'workers': 0.5},
-            {'item': 25, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 26, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.54, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            {'item': 27, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.82, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
-            {'item': 27, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 28, 'step': 5, 'machine': 'Kappa 350 / Kappa 330', 'time': 7.43, 'name': 'Cutting Stripping Jacket Cable 5-Wire', 'workers': 0.5},
-            {'item': 29, 'step': 7, 'machine': 'Kappa 350 / Kappa 330', 'time': 7.50, 'name': 'Cutting Stripping Jacket Cable 7-Wire', 'workers': 0.5},
-            {'item': 29, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 12.00, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 30, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.34, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            {'item': 30, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 31, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.45, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            {'item': 31, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 32, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.45, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            {'item': 32, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 33, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.30, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            {'item': 33, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 34, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.61, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 35, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.61, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 36, 'step': 2, 'machine': 'Alpha 550 / Alpha 433', 'time': 3.30, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5},
-            {'item': 37, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.54, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            {'item': 37, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 38, 'step': 7, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.53, 'name': 'Cutting Stripping Jacket Cable 7-Wire', 'workers': 0.5},
-            {'item': 38, 'step': 9, 'machine': 'Kappa 350 / Kappa 330', 'time': 16.00, 'name': 'Cutting Stripping Jacket Cable 9-Wire', 'workers': 0.5},
-            {'item': 39, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.68, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            {'item': 39, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 40, 'step': 4, 'machine': 'Kappa 350 / Kappa 330', 'time': 6.33, 'name': 'Cutting Stripping Jacket Cable 4-Wire', 'workers': 0.5},
-            {'item': 40, 'step': 8, 'machine': 'Kappa 350 / Kappa 330', 'time': 8.12, 'name': 'Cutting Stripping Jacket Cable 8-Wire', 'workers': 0.5},
-            {'item': 41, 'step': 1, 'machine': 'Sigma 688 / Alpha 488', 'time': 6.90, 'name': 'Cutting Stripping Crimping Twisting Single Wires', 'workers': 0.5}
-        ]
+        demand_data =    {'Item': [1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20],
+ 'SAP_TN': [249076,
+  249077,
+  249313,
+  249314,
+  249315,
+  249316,
+  249317,
+  249078,
+  249079,
+  249080,
+  249081,
+  249082,
+  249083,
+  249084,
+  249085,
+  249086,
+  249087,
+  249088,
+  249089,
+  249090],
+ 'SAP_PL': [249041,
+  249042,
+  238895,
+  238896,
+  238897,
+  238899,
+  238900,
+  249043,
+  249044,
+  249045,
+  249046,
+  249047,
+  249048,
+  249049,
+  249050,
+  249051,
+  249052,
+  249053,
+  249054,
+  249055],
+ 'DCC_Type': ['60° & 30°',
+  '60° & 30°',
+  '60° & 90°B',
+  '60° & 90°B',
+  '60° & 2*90°B',
+  '60° & 90°B',
+  '60° & 2*90°B',
+  '30°',
+  '90°B',
+  '90°',
+  '60°',
+  '60°',
+  '60°',
+  '180°',
+  '180°',
+  '30°',
+  '90°B',
+  '60°',
+  '90°',
+  '60°'],
+ 'Description': ['4 Wire Jacket 2xDCC Modul 9Y4252B',
+  '4 Wire Jacket 2xDCC Modul 9Y4256B',
+  '4 Wire Jacket 2xDCC Modul 9Y4251',
+  '6 Wire Jacket 2xDCC Modul 9Y4251A',
+  '6 Wire Jacket 3xDCC Modul 9Y4252',
+  '6 Wire Jacket 2xDCC Modul 9Y4255',
+  '6 Wire Jacket 3xDCC Modul 9Y4256',
+  'Twisted Wires 1xDCC Modul 9Y4279 AA,AB,AC',
+  'Twisted Wires 1xDCC Modul 9Y4279 AA,AB,AC',
+  'Twisted Wires 1xDCC Modul 9Y4279 AD,AE,AF',
+  'Twisted Wires 1xDCC Modul 9Y4279 AD,AE,AF',
+  'Twisted Wires 1xDCC Modul 9Y4279 AA,AD',
+  'Twisted Wires 1xDCC Modul 9Y4279 AB,AC,AE,AF',
+  'Twisted Wires 1xDCC Modul 9Y4279 AA,AD',
+  'Twisted Wires 1xDCC Modul 9Y4279 AB,AC,AE,AF',
+  'Twisted Wires 1xDCC Modul 9Y4286 M,N',
+  'Twisted Wires 1xDCC Modul 9Y4286 M,N',
+  'Twisted Wires 1xDCC Modul 9Y4286 P,Q',
+  'Twisted Wires 1xDCC Modul 9Y4286 P,Q',
+  'Twisted Wires 1xDCC Modul 9Y4286 N,Q'],
+ 'Demand_2024': [121,
+  121,
+  1141,
+  201,
+  1221,
+  1342,
+  1221,
+  1221,
+  1221,
+  120,
+  120,
+  1127,
+  214,
+  1127,
+  214,
+  1221,
+  1221,
+  120,
+  120,
+  201]}
+
+        process_routing = [{'item': 2,
+  'machine': 'Kappa 350 / Kappa 330',
+  'name': 'Cutting Stripping Jacket Cable 4-Wire',
+  'step': 4,
+  'time': 6.76,
+  'workers': 0.5},
+ {'item': 2,
+  'machine': 'Wire Cut & Separating Station',
+  'name': 'Separating & Cutting Wires to Length 1 of 2 Pairs',
+  'step': 10,
+  'time': 8.12,
+  'workers': 0.5},
+ {'item': 2,
+  'machine': 'PUR-Tube Assembly Station',
+  'name': 'Assembly PUR-Tube 3,5x1,35mm Jacket Cable 111mm-200mm',
+  'step': 18,
+  'time': 20.88,
+  'workers': 0.5},
+ {'item': 2,
+  'machine': 'SKM DCPC Crimp (Crimp and Ass)',
+  'name': 'Crimping & Assembly DCC Connector',
+  'step': 30,
+  'time': 20.0,
+  'workers': 0.5},
+ {'item': 2,
+  'machine': 'ARBURG 375ST Machine 11,12,13',
+  'name': 'Overmolding 60° Left 9J1 973 752 Cod. C Blue Cod. Up With CPA',
+  'step': 54,
+  'time': 18.72,
+  'workers': 0.5},
+ {'item': 2,
+  'machine': 'ARBURG 375ST Machine 6-10',
+  'name': 'Overmolding 30° Right 9Y4 973 752 A Cod. A Black Cod. Up With CPA',
+  'step': 60,
+  'time': 20.0,
+  'workers': 0.5},
+ {'item': 2,
+  'machine': 'SKM Seal and outer Housing Assembly DCC',
+  'name': 'Assembly Seal & Outer Housing Round Table Jacket Cable',
+  'step': 61,
+  'time': 19.58,
+  'workers': 0.5},
+ {'item': 2,
+  'machine': '',
+  'name': 'TOTAL(sec)',
+  'step': 201,
+  'time': 114.06,
+  'workers': 0.5},
+ {'item': 2,
+  'machine': '',
+  'name': 'SAP TIMES',
+  'step': 202,
+  'time': 1.9,
+  'workers': 0.5},
+ {'item': 3,
+  'machine': 'Sigma 688 / Alpha 488',
+  'name': 'Cutting Stripping Crimping Twisting Single Wires',
+  'step': 1,
+  'time': 7.3,
+  'workers': 0.5},
+ {'item': 3,
+  'machine': 'PUR-Tube Assembly Station',
+  'name': 'Assembly PUR-Tube 3,5x1,35mm PUR-Tube 60mm-180mm',
+  'step': 20,
+  'time': 5.93,
+  'workers': 0.5},
+ {'item': 3,
+  'machine': 'Connector Assembly Station',
+  'name': 'Assembly DCC Connector Manually Single Wires',
+  'step': 31,
+  'time': 8.09,
+  'workers': 0.5},
+ {'item': 3,
+  'machine': 'ARBURG 375ST Machine 6-10',
+  'name': 'Overmolding 30° Right 9Y4 973 752 A Cod. A Black Cod. Up With CPA',
+  'step': 60,
+  'time': 20.0,
+  'workers': 0.5},
+ {'item': 3,
+  'machine': 'SKM Seal and outer Housing Assembly DCC',
+  'name': 'Assembly Seal & Outer Housing Round Table Single Wires',
+  'step': 62,
+  'time': 7.88,
+  'workers': 0.5},
+ {'item': 3,
+  'machine': 'Cutting Automation',
+  'name': 'Cutting Automation',
+  'step': 67,
+  'time': 8.0,
+  'workers': 0.5},
+ {'item': 3,
+  'machine': '',
+  'name': 'TOTAL(sec)',
+  'step': 201,
+  'time': 57.2,
+  'workers': 0.5},
+ {'item': 3,
+  'machine': '',
+  'name': 'SAP TIMES',
+  'step': 202,
+  'time': 0.95,
+  'workers': 0.5},
+ {'item': 4,
+  'machine': 'Sigma 688 / Alpha 488',
+  'name': 'Cutting Stripping Crimping Twisting Single Wires',
+  'step': 1,
+  'time': 7.29,
+  'workers': 0.5},
+ {'item': 4,
+  'machine': 'PUR-Tube Assembly Station',
+  'name': 'Assembly PUR-Tube 3,5x1,35mm PUR-Tube 60mm-180mm',
+  'step': 20,
+  'time': 5.93,
+  'workers': 0.5},
+ {'item': 4,
+  'machine': 'Connector Assembly Station',
+  'name': 'Assembly DCC Connector Manually Single Wires',
+  'step': 31,
+  'time': 8.09,
+  'workers': 0.5}]
+
+
         
-        # Create products and process steps with optimized batch sizes
+        # Create products and process steps
         for i in range(len(demand_data['Item'])):
             item = demand_data['Item'][i]
-            demand = demand_data['Demand_2024'][i]
-            
-            if demand is None or demand <= 0:
-                continue
-            
-            # Calculate optimal batch size
-            batch_size, num_batches, ideal_batch = calculate_optimal_batch_size(
-                demand, max_num_batches, min_batch_size, max_batch_size
-            )
+            batch_size = int(np.ceil(demand_data['Demand_2024'][i] / 12))
             
             product = Product.objects.create(
                 item=item,
@@ -719,9 +710,9 @@ def initialize_data(request):
                 sap_pl=str(demand_data['SAP_PL'][i]) if demand_data['SAP_PL'][i] else None,
                 dcc_type=demand_data['DCC_Type'][i],
                 description=demand_data['Description'][i],
-                demand_2024=demand,
+                demand_2024=demand_data['Demand_2024'][i],
                 batch_size=batch_size,
-                num_batches=num_batches
+                num_batches=12
             )
             
             # Add process steps for this product
@@ -740,31 +731,20 @@ def initialize_data(request):
         machine_count = Machine.objects.count()
         step_count = ProcessStep.objects.count()
         
-        # Calculate average batch size
-        products = Product.objects.filter(demand_2024__gt=0)
-        avg_batch_size = products.aggregate(avg=Avg('batch_size'))['avg'] or 0
-        
         return Response({
-            'message': 'Database initialized successfully with optimized batch sizes',
+            'message': 'Database initialized successfully',
             'products_created': product_count,
             'machines_created': machine_count,
-            'process_steps_created': step_count,
-            'batch_optimization': {
-                'parameters': {
-                    'max_num_batches': max_num_batches,
-                    'min_batch_size': min_batch_size,
-                    'max_batch_size': max_batch_size
-                },
-                'avg_batch_size': round(avg_batch_size, 2)
-            }
+            'process_steps_created': step_count
         }, status=status.HTTP_201_CREATED)
         
     except Exception as e:
+        print(str(e))
         return Response({
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
-    
+
+
 @api_view(['GET'])
 def get_buffer_optimization(request):
     """
