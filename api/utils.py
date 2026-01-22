@@ -1,5 +1,8 @@
 import pandas as pd
 import numpy as np
+from datetime import datetime, timedelta
+from django.db.models import Sum
+from .models import Product, ProcessStep, ProductionSchedule
 
 SHIFT_LABELS = [
     'Shift 1', 'Shift 1 B', 'Shift 2', 'Shift 2 A', 'Shift 3', 'Shift 3 C',
