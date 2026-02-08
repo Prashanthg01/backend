@@ -45,7 +45,8 @@ expected_delay_hours_at_m is average operation time on machine
 
 buffer_m_units = throughput_per_hour * expected_delay_hours_at_m * safety_factor
 
-
+---------------------- Run Celery ---------------------
+celery -A backend worker --loglevel=info -P solo
 
 
 
