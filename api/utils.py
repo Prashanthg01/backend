@@ -1,11 +1,14 @@
+# api/utils.py
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from collections import defaultdict
 from django.db.models import Sum
 from .models import Product, ProcessStep, ProductionSchedule
 
 from pulp import (
-    LpProblem, LpMinimize, LpMaximize, LpVariable, LpInteger, LpContinuous,
+    LpProblem, LpMinimize, LpMaximize, LpVariable, LpInteger, LpContinuous, LpBinary,
     lpSum, LpStatus, value, PULP_CBC_CMD
 )
 
@@ -24,146 +27,232 @@ SHIFT_LABELS = [
 
 # Solver shared across the module — silent output
 _SOLVER = PULP_CBC_CMD(msg=0)
+_SOLVER_TIMED = PULP_CBC_CMD(msg=0, timeLimit=45)   # 45-second wall-clock cap per solve
+
+
+# ===========================================================================
+# 0.  LEFT-SHIFT COMPACTION  (gap elimination)                         ← NEW
+# ===========================================================================
+# After a greedy dispatch, every operation is slid as early as possible
+# while respecting:
+#   a) Machine non-overlap  – no two ops on the same machine overlap
+#   b) Job precedence       – step N+1 can only start after step N ends
+#
+# WHY GAPS APPEAR IN THE GREEDY SCHEDULE
+# ----------------------------------------
+# 1. Precedence-induced starvation: a machine is free but the next operation
+#    waiting for it can't start because its upstream step (on a DIFFERENT
+#    machine) hasn't finished yet. The greedy dispatcher moves on, leaving
+#    a hole.
+# 2. Batch-interleaving gaps: different products share a machine; when
+#    product A's batch finishes, product B's next batch isn't ready yet.
+# 3. SPT ordering mismatches: sorting globally by duration causes batches
+#    to be processed out of natural order, leaving holes while upstream
+#    ops complete.
+#
+# THE FIX
+# --------
+# Iterate over all ops (sorted by start time) and for each op compute:
+#   earliest_start = max(machine_free_time, predecessor_end_time)
+# If earliest_start < op.current_start, slide the op left.
+# Repeat until no op moves (converges in 2–3 passes, O(n²) total).
+
+def left_shift_compaction(schedule: list, max_passes: int = 5) -> list:
+    """
+    Eliminate idle gaps in a greedy-dispatched schedule by sliding every
+    operation as early as possible.
+
+    Parameters
+    ----------
+    schedule : list[dict]
+        Each dict is one scheduled operation and MUST have keys:
+            'machine_name' (str)
+            'batch_id'     (str)   – job identifier
+            'step_number'  (int)   – 1-based step within the job
+            'start_hrs'    (float) – hours from schedule epoch
+            'end_hrs'      (float)
+            'dur_hours'    (float)
+            'start_dt'     (datetime)
+            'end_dt'       (datetime)
+    start_dt_epoch : not needed – we use start_hrs/end_hrs internally.
+
+    Returns
+    -------
+    Same list with start_hrs / end_hrs / start_dt / end_dt mutated in-place.
+    """
+    if not schedule:
+        return schedule
+
+    # Determine epoch from the minimum start across all ops
+    epoch_dt = min(op['start_dt'] for op in schedule)
+
+    for pass_no in range(max_passes):
+        moved = 0
+
+        # Sort by current start time so earlier ops anchor first
+        schedule.sort(key=lambda o: (o['start_hrs'], o['machine_name']))
+
+        # Rebuild machine-timeline and job-end maps incrementally
+        # machine_timeline[m] = sorted list of (start_hrs, end_hrs)
+        machine_timeline: dict = {}
+        # job_end[batch_id][step_number] = end_hrs
+        job_end: dict = {}
+
+        for op in schedule:
+            m     = op['machine_name']
+            job   = op['batch_id']
+            step  = op['step_number']
+            dur   = op['dur_hours']
+
+            # Lower bound from job precedence (predecessor step must be done)
+            pred_end = _predecessor_end_hrs(job_end, job, step)
+
+            # Earliest gap on this machine that fits `dur` starting from pred_end
+            earliest = _first_fit_gap_hrs(
+                machine_timeline.get(m, []),
+                pred_end,
+                dur,
+            )
+
+            # Only move if we can genuinely shift earlier (> 1-second tolerance)
+            if earliest < op['start_hrs'] - (1 / 3600):
+                op['start_hrs'] = earliest
+                op['end_hrs']   = earliest + dur
+                op['start_dt']  = epoch_dt + timedelta(hours=earliest)
+                op['end_dt']    = epoch_dt + timedelta(hours=earliest + dur)
+                moved += 1
+
+            # Register op in machine timeline
+            if m not in machine_timeline:
+                machine_timeline[m] = []
+            machine_timeline[m].append((op['start_hrs'], op['end_hrs']))
+            machine_timeline[m].sort()
+
+            # Register job step completion
+            if job not in job_end:
+                job_end[job] = {}
+            job_end[job][step] = op['end_hrs']
+
+        if moved == 0:
+            break   # converged
+
+    return schedule
+
+
+def _predecessor_end_hrs(job_end: dict, job: str, step: int) -> float:
+    """Return end_hrs of step-1 for this job, or 0.0 if step == 1."""
+    if step <= 1:
+        return 0.0
+    return job_end.get(job, {}).get(step - 1, 0.0)
+
+
+def _first_fit_gap_hrs(
+    timeline: list,          # sorted list of (start_hrs, end_hrs)
+    earliest: float,
+    duration: float,
+) -> float:
+    """
+    Find the earliest start >= `earliest` where `duration` fits without
+    overlapping any interval in `timeline`.
+    """
+    candidate = earliest
+    for busy_start, busy_end in timeline:
+        if busy_end <= candidate:
+            continue                          # busy block entirely before us
+        if candidate + duration <= busy_start:
+            break                             # fits in gap before this block
+        candidate = max(candidate, busy_end)  # pushed past this block
+    return candidate
+
+
+def count_schedule_gaps(schedule: list, min_gap_sec: int = 60) -> dict:
+    """
+    Count idle gaps remaining in a schedule after compaction.
+    Useful for logging / returning in API responses.
+
+    Returns
+    -------
+    dict with keys: total_gaps, total_idle_hours, per_machine
+    """
+    machine_ops: dict = defaultdict(list)
+    for op in schedule:
+        machine_ops[op['machine_name']].append(op)
+
+    total_gaps = 0
+    total_idle = 0.0
+    per_machine = {}
+
+    for m, mops in machine_ops.items():
+        sorted_ops = sorted(mops, key=lambda o: o['start_hrs'])
+        gaps  = 0
+        idle  = 0.0
+        for i in range(1, len(sorted_ops)):
+            gap_h = sorted_ops[i]['start_hrs'] - sorted_ops[i-1]['end_hrs']
+            if gap_h * 3600 > min_gap_sec:
+                gaps  += 1
+                idle  += gap_h
+        total_gaps += gaps
+        total_idle += idle
+        per_machine[m] = {'gaps': gaps, 'idle_hours': round(idle, 3)}
+
+    return {
+        'total_gaps':       total_gaps,
+        'total_idle_hours': round(total_idle, 2),
+        'per_machine':      per_machine,
+    }
 
 
 # ===========================================================================
 # 1.  BATCH-SIZE OPTIMISATION  (single-product ILP)
 # ===========================================================================
-# Previous approach: simple ceil-division heuristic with manual clamping.
-# PuLP model: choose (batch_size, num_batches) that covers demand exactly,
-# stays inside [min_batch_size, max_batch_size], uses ≤ max_num_batches,
-# and MINIMISES num_batches (fewer set-ups → less downtime).
 
 def calculate_optimal_batch_size(demand, max_num_batches=25, min_batch_size=50, max_batch_size=500):
     """
     Solve a single-product batch-size ILP with PuLP.
-
-    Decision variables
-    ------------------
-    B  (integer) – size of every batch
-    N  (integer) – number of batches produced
-
-    Objective
-    ---------
-    Minimise N  (fewer batches = fewer machine set-ups)
-
-    Constraints
-    -----------
-    B × N  ≥  demand          (full demand coverage)
-    min_batch_size  ≤  B  ≤  max_batch_size
-    1  ≤  N  ≤  max_num_batches
-
-    Returns
-    -------
-    tuple: (batch_size, num_batches, ideal_batch_size_float)
     """
     if demand <= 0:
         return 0, 0, 0.0
 
-    ideal_batch_size = demand / max_num_batches          # kept for reporting
+    ideal_batch_size = demand / max_num_batches
 
-    # ------------------------------------------------------------------
-    # Build the ILP
-    # ------------------------------------------------------------------
     prob = LpProblem("BatchSizeOptimization", LpMinimize)
 
     B = LpVariable("batch_size", lowBound=min_batch_size, upBound=max_batch_size, cat=LpInteger)
     N = LpVariable("num_batches", lowBound=1,            upBound=max_num_batches, cat=LpInteger)
 
-    # Objective: minimise number of batches
     prob += N
 
-    # Coverage: B * N >= demand
-    # PuLP cannot handle a product of two decision variables directly (that
-    # would be quadratic).  We linearise by noting that for every candidate
-    # value of N in [1, max_num_batches] the required B is ceil(demand/N).
-    # We therefore introduce a binary selector y_n for each possible N and
-    # rewrite the problem as a selection model.
-    # ------------------------------------------------------------------
-    # Reformulation as a binary-selection (big-M) model
-    # ------------------------------------------------------------------
-    candidates = list(range(1, max_num_batches + 1))               # possible N values
+    candidates = list(range(1, max_num_batches + 1))
     y = {n: LpVariable(f"y_{n}", cat="Binary") for n in candidates}
 
-    # Exactly one candidate must be chosen
     prob += lpSum(y[n] for n in candidates) == 1
-
-    # Link N to the chosen candidate
     prob += N == lpSum(n * y[n] for n in candidates)
 
-    # Link B: for the chosen candidate n, B must be ≥ ceil(demand / n)
-    # Using big-M: B ≥ ceil(demand/n) - M*(1 - y_n)   for every n
-    M = max_batch_size                                  # safe big-M upper bound
+    M = max_batch_size
     for n in candidates:
         required_B = int(np.ceil(demand / n))
         prob += B >= required_B - M * (1 - y[n])
 
-    # Upper-bound B to max_batch_size is already in the variable definition.
-    # If ceil(demand / n) > max_batch_size for a candidate n, that candidate
-    # is naturally infeasible (B can't satisfy the lower bound).  We can
-    # tighten by explicitly forbidding it:
     for n in candidates:
         if int(np.ceil(demand / n)) > max_batch_size:
             prob += y[n] == 0
 
-    # ------------------------------------------------------------------
-    # Solve
-    # ------------------------------------------------------------------
     prob.solve(_SOLVER)
 
     if LpStatus[prob.status] == "Optimal":
         return int(value(B)), int(value(N)), round(ideal_batch_size, 2)
 
-    # ── Fallback (should never fire for valid inputs) ──────────────────
     fallback_N = max(1, min(max_num_batches, int(np.ceil(demand / min_batch_size))))
     fallback_B = int(np.ceil(demand / fallback_N))
     return fallback_B, fallback_N, round(ideal_batch_size, 2)
 
 
 # ===========================================================================
-# 2.  JOINT MULTI-PRODUCT BATCH OPTIMISATION  (new)
+# 2.  JOINT MULTI-PRODUCT BATCH OPTIMISATION
 # ===========================================================================
-# When many products share the same machines, optimising each product in
-# isolation can create unbalanced machine loads.  This model minimises the
-# MAXIMUM total processing hours across all machines (i.e. the makespan
-# bottleneck) while respecting per-product batch constraints.
-#
-# Decision variables
-# ------------------
-# B_i  (integer) – batch size for product i
-# N_i  (integer) – number of batches for product i
-# C     (continuous) – the makespan proxy (max machine load)
-#
-# Constraints per product i
-# -------------------------
-# B_i * N_i >= demand_i               (linearised via binary selectors, same
-#                                       technique as calculate_optimal_batch_size)
-# min_batch ≤ B_i ≤ max_batch
-# 1        ≤ N_i ≤ max_num_batches
-#
-# Per-machine load constraint
-# ---------------------------
-# For each machine m:   Σ (cycle_time_{i,m} * B_i * N_i)  ≤  C
-# (again linearised using the binary selectors already present)
-#
-# Objective: minimise C
 
 def optimize_product_batches_jointly(products, max_num_batches, min_batch_size, max_batch_size):
-    """
-    Multi-product joint batch optimisation via PuLP.
-
-    Parameters
-    ----------
-    products  : QuerySet[Product]  – products with demand > 0
-    max_num_batches, min_batch_size, max_batch_size – global bounds
-
-    Returns
-    -------
-    list[dict]  – one log entry per product (same shape as the old
-                  optimize_product_batches return value)
-    """
-    # ── Pre-fetch process steps grouped by product & machine ──────────
-    # structure: { product.pk: { machine_name: cycle_time_seconds } }
+    """Multi-product joint batch optimisation via PuLP."""
     step_map = {}
     all_machines = set()
     for product in products:
@@ -173,37 +262,28 @@ def optimize_product_batches_jointly(products, max_num_batches, min_batch_size, 
             step_map[product.pk][s.machine.name] = s.cycle_time_seconds
             all_machines.add(s.machine.name)
 
-    product_list = list(products)                        # materialise QuerySet once
+    product_list = list(products)
 
-    # ── Build the ILP ─────────────────────────────────────────────────
     prob = LpProblem("JointBatchOptimization", LpMinimize)
 
-    # Upper bound on total processing hours used as big-M / C bound
-    # Worst case: every product at max_batch_size * max_num_batches
     total_max_hours = sum(
         max_batch_size * max_num_batches * sum(step_map.get(p.pk, {}).values()) / 3600
         for p in product_list
     )
     C = LpVariable("makespan_proxy", lowBound=0, upBound=total_max_hours, cat=LpContinuous)
 
-    prob += C                                            # objective: minimise C
+    prob += C
 
-    # ── Per-product variables & demand-coverage constraints ──────────
-    # For each product we use the same binary-selector trick as above.
     candidates = list(range(1, max_num_batches + 1))
 
-    B   = {}          # B[pk]  – batch size
-    N   = {}          # N[pk]  – num batches
-    Y   = {}          # Y[pk]  – dict of binary selectors  { n: var }
-    # We also store, for each product, the *effective demand* contributed
-    # to each machine per candidate: demand_i / n_i is already rounded up
-    # to B_i = ceil(demand_i / n_i), so total units = B_i * n_i.
-    # We keep a helper: for candidate n, total_units = ceil(demand / n) * n
+    B = {}
+    N = {}
+    Y = {}
 
     for p in product_list:
-        pk   = p.pk
-        dem  = p.demand_2024
-        tag  = f"p{pk}"
+        pk  = p.pk
+        dem = p.demand_2024
+        tag = f"p{pk}"
 
         B[pk] = LpVariable(f"B_{tag}", lowBound=min_batch_size, upBound=max_batch_size, cat=LpInteger)
         N[pk] = LpVariable(f"N_{tag}", lowBound=1,              upBound=max_num_batches, cat=LpInteger)
@@ -212,33 +292,22 @@ def optimize_product_batches_jointly(products, max_num_batches, min_batch_size, 
         for n in candidates:
             Y[pk][n] = LpVariable(f"y_{tag}_{n}", cat="Binary")
 
-        # Exactly one candidate
         prob += lpSum(Y[pk][n] for n in candidates) == 1
-
-        # Link N
         prob += N[pk] == lpSum(n * Y[pk][n] for n in candidates)
 
-        # Link B (big-M lower bounds)
         M = max_batch_size
         for n in candidates:
             req = int(np.ceil(dem / n))
             prob += B[pk] >= req - M * (1 - Y[pk][n])
             if req > max_batch_size:
-                prob += Y[pk][n] == 0          # infeasible candidate
-
-    # ── Machine-load ≤ C  (linearised) ────────────────────────────────
-    # For machine m: total_hours_m = Σ_i  cycle_time_i_m * B_i * N_i / 3600
-    # B_i * N_i is NOT a single variable, but when candidate n is active:
-    #   B_i = ceil(demand_i / n),  N_i = n   →  B_i * N_i = ceil(demand_i/n)*n
-    # So we substitute using the binary selectors:
-    #   B_i * N_i  ≈  Σ_n  [ ceil(demand_i/n) * n ] * y_{i,n}
+                prob += Y[pk][n] == 0
 
     for m in all_machines:
         machine_load = []
         for p in product_list:
-            pk        = p.pk
-            dem       = p.demand_2024
-            cyc_time  = step_map.get(pk, {}).get(m, 0)
+            pk       = p.pk
+            dem      = p.demand_2024
+            cyc_time = step_map.get(pk, {}).get(m, 0)
             if cyc_time == 0:
                 continue
             for n in candidates:
@@ -249,10 +318,8 @@ def optimize_product_batches_jointly(products, max_num_batches, min_batch_size, 
         if machine_load:
             prob += lpSum(machine_load) <= C
 
-    # ── Solve ─────────────────────────────────────────────────────────
     prob.solve(_SOLVER)
 
-    # ── Extract results ──────────────────────────────────────────────
     log = []
     if LpStatus[prob.status] == "Optimal":
         for p in product_list:
@@ -272,300 +339,17 @@ def optimize_product_batches_jointly(products, max_num_batches, min_batch_size, 
                 'ideal_batch_size': round(p.demand_2024 / max_num_batches, 2)
             })
     else:
-        # Fallback: solve each product independently
         log = optimize_product_batches(products, max_num_batches, min_batch_size, max_batch_size)
 
     return log
 
 
 # ===========================================================================
-# 3.  JOB-SHOP SCHEDULING  (PuLP makespan minimisation)
+# 3.  BUFFER ALLOCATION OPTIMISATION
 # ===========================================================================
-# The old greedy scheduler assigned start times sequentially in product
-# order, which can leave machines idle while a later product could fill gaps.
-#
-# PuLP model (classic job-shop with big-M disjunctive constraints):
-#
-# Decision variables
-# ------------------
-# S_{i,b,k}   (continuous) – start time (hours from epoch) of job (product i,
-#                              batch b, step k)
-# C_max       (continuous) – makespan (objective)
-# Z_{i,b,k, j,c,l}  (binary) – 1 if operation (i,b,k) runs BEFORE (j,c,l)
-#                                on the same machine
-#
-# Constraints
-# -----------
-# Precedence:  S_{i,b,k} ≥ S_{i,b,k-1} + duration_{i,b,k-1}
-# No-overlap:  for every pair sharing a machine, exactly one ordering holds
-#              S_{i,b,k} ≥ S_{j,c,l} + dur_{j,c,l} - M*(1-Z)    if Z=1
-#              S_{j,c,l} ≥ S_{i,b,k} + dur_{i,b,k} - M*(1-Z')   if Z'=1-Z
-# Makespan:    C_max ≥ S_{i,b,k} + duration_{i,b,k}   for all ops
-#
-# Objective: minimise C_max
-
-def generate_production_schedule(products, use_pulp=None, time_limit_seconds=60):
-    """
-    Hybrid job-shop scheduler with intelligent PuLP usage.
-
-    Strategy
-    --------
-    - For SMALL problems (<100 operations): Use PuLP job-shop optimizer
-    - For LARGE problems (≥100 operations): Use improved greedy heuristic
-    - User can force PuLP with use_pulp=True (not recommended for large problems)
-
-    Parameters
-    ----------
-    products : QuerySet[Product]
-    use_pulp : bool or None
-        - None (default): Auto-decide based on problem size
-        - True: Force PuLP (may be slow)
-        - False: Force greedy
-    time_limit_seconds : int
-        Maximum time for PuLP solver (default 60 seconds)
-
-    Returns
-    -------
-    tuple:
-        - list[ProductionSchedule]  – ORM records (created in DB)
-        - dict                      – machine_name → final availability datetime
-    """
-    # ── Collect all operations ────────────────────────────────────────
-    operations = []
-    machine_ops = {}
-
-    for product in products:
-        steps = ProcessStep.objects.filter(
-            product=product, cycle_time_seconds__gt=0
-        ).order_by('step_number')
-
-        for batch_num in range(1, product.num_batches + 1):
-            prev_step_number = None
-            for step in steps:
-                dur_hours = (step.cycle_time_seconds * product.batch_size) / 3600
-                op = {
-                    'idx':              len(operations),
-                    'product':          product,
-                    'batch_num':        batch_num,
-                    'step':             step,
-                    'step_number':      step.step_number,
-                    'machine_name':     step.machine.name,
-                    'machine':          step.machine,
-                    'duration_hours':   dur_hours,
-                    'batch_id':         f"Item{product.item}_B{batch_num}",
-                    'prev_op_idx':      None,
-                }
-                if prev_step_number is not None:
-                    op['prev_op_idx'] = len(operations) - 1
-
-                operations.append(op)
-                prev_step_number = step.step_number
-                machine_ops.setdefault(step.machine.name, []).append(op['idx'])
-
-    if not operations:
-        return [], {}
-
-    # ── Decide whether to use PuLP ────────────────────────────────────
-    num_operations = len(operations)
-    num_binary_vars = sum(
-        len(ops) * (len(ops) - 1) // 2 
-        for ops in machine_ops.values()
-    )
-    
-    # Auto-decide: use PuLP only for small problems
-    if use_pulp is None:
-        use_pulp = (num_operations <= 100 and num_binary_vars <= 500)
-    
-    print(f"📊 Schedule size: {num_operations} operations, {num_binary_vars} disjunctive pairs")
-    print(f"🔧 Using: {'PuLP optimizer' if use_pulp else 'Improved greedy heuristic'}")
-
-    start_date = datetime.now()
-
-    # ── Path 1: PuLP job-shop (for small problems) ───────────────────
-    # if use_pulp:
-    schedule_records, machine_availability = _pulp_job_shop_schedule(
-        operations, machine_ops, start_date, time_limit_seconds
-    )
-    if schedule_records:  # Success
-        return schedule_records, machine_availability
-        # Fall through to greedy if PuLP failed
-
-    # ── Path 2: Improved greedy heuristic ─────────────────────────────
-    # return _improved_greedy_schedule(operations, machine_ops, start_date)
-
-
-def _pulp_job_shop_schedule(operations, machine_ops, start_date, time_limit):
-    """PuLP job-shop optimizer with timeout."""
-    horizon = sum(op['duration_hours'] for op in operations)
-    prob = LpProblem("JobShopScheduling", LpMinimize)
-
-    S = {op['idx']: LpVariable(f"S_{op['idx']}", lowBound=0, upBound=horizon, cat=LpContinuous)
-         for op in operations}
-    C_max = LpVariable("C_max", lowBound=0, upBound=horizon, cat=LpContinuous)
-    prob += C_max
-
-    # Precedence constraints
-    for op in operations:
-        if op['prev_op_idx'] is not None:
-            prev = operations[op['prev_op_idx']]
-            prob += S[op['idx']] >= S[prev['idx']] + prev['duration_hours']
-
-    # Makespan bounds
-    for op in operations:
-        prob += C_max >= S[op['idx']] + op['duration_hours']
-
-    # No-overlap (disjunctive) constraints
-    for m_name, op_indices in machine_ops.items():
-        for a in range(len(op_indices)):
-            for b in range(a + 1, len(op_indices)):
-                i = op_indices[a]
-                j = op_indices[b]
-                dur_i = operations[i]['duration_hours']
-                dur_j = operations[j]['duration_hours']
-                Z = LpVariable(f"Z_{i}_{j}", cat="Binary")
-                prob += S[j] >= S[i] + dur_i - horizon * (1 - Z)
-                prob += S[i] >= S[j] + dur_j - horizon * Z
-
-    # Solve with timeout
-    solver = PULP_CBC_CMD(msg=0, timeLimit=time_limit)
-    prob.solve(solver)
-
-    # Extract solution
-    if LpStatus[prob.status] == "Optimal":
-        schedule_records = []
-        machine_availability = {}
-        
-        for op in operations:
-            start_hours = value(S[op['idx']])
-            start_time  = start_date + timedelta(hours=start_hours)
-            end_time    = start_time + timedelta(hours=op['duration_hours'])
-
-            machine_availability[op['machine_name']] = max(
-                machine_availability.get(op['machine_name'], start_date),
-                end_time
-            )
-
-            schedule_records.append(
-                ProductionSchedule.objects.create(
-                    machine=op['machine'],
-                    product=op['product'],
-                    process_step=op['step'],
-                    batch_id=op['batch_id'],
-                    batch_num=op['batch_num'],
-                    batch_size=op['product'].batch_size,
-                    start_time=start_time,
-                    end_time=end_time,
-                    duration_hours=round(op['duration_hours'], 4)
-                )
-            )
-        return schedule_records, machine_availability
-    
-    print(f"⚠️  PuLP solver status: {LpStatus[prob.status]} - falling back to greedy")
-    return [], {}
-
-
-# def _improved_greedy_schedule(operations, machine_ops, start_date):
-#     """
-#     Improved greedy scheduler with priority-based dispatching.
-    
-#     Enhancement over original: 
-#     - Sorts operations by 'earliest due date' (end of precedence chain)
-#     - Within same due date, prioritizes shorter operations (SPT rule)
-#     """
-#     # Calculate priority for each operation
-#     for op in operations:
-#         # Find the latest step in this batch's chain
-#         current = op
-#         chain_length = 0
-#         while current is not None:
-#             chain_length += current['duration_hours']
-#             next_idx = None
-#             # Find if this op is a predecessor to another
-#             for other in operations:
-#                 if other.get('prev_op_idx') == current['idx']:
-#                     next_idx = other['idx']
-#                     break
-#             current = operations[next_idx] if next_idx is not None else None
-        
-#         op['priority'] = -chain_length  # Negative so longer chains = higher priority
-#         op['spt'] = op['duration_hours']  # Shortest processing time
-
-#     # Sort by priority (longest remaining chain first), then SPT
-#     sorted_ops = sorted(operations, key=lambda x: (x['priority'], x['spt']))
-
-#     machine_availability = {}
-#     batch_completion = {}
-#     schedule_records = []
-
-#     for op in sorted_ops:
-#         machine_key = op['machine_name']
-#         machine_ready = machine_availability.get(machine_key, start_date)
-
-#         # Wait for previous step in batch
-#         if op['prev_op_idx'] is not None:
-#             prev_op = operations[op['prev_op_idx']]
-#             prev_key = f"{prev_op['batch_id']}_Step{prev_op['step_number']}"
-#             prev_done = batch_completion.get(prev_key, start_date)
-#         else:
-#             prev_done = start_date
-
-#         start_time = max(machine_ready, prev_done)
-#         end_time = start_time + timedelta(hours=op['duration_hours'])
-
-#         machine_availability[machine_key] = end_time
-#         batch_completion[f"{op['batch_id']}_Step{op['step_number']}"] = end_time
-
-#         schedule_records.append(
-#             ProductionSchedule.objects.create(
-#                 machine=op['machine'],
-#                 product=op['product'],
-#                 process_step=op['step'],
-#                 batch_id=op['batch_id'],
-#                 batch_num=op['batch_num'],
-#                 batch_size=op['product'].batch_size,
-#                 start_time=start_time,
-#                 end_time=end_time,
-#                 duration_hours=round(op['duration_hours'], 4)
-#             )
-#         )
-
-#     return schedule_records, machine_availability
-
-
-
-# ===========================================================================
-# 4.  BUFFER ALLOCATION OPTIMISATION  (new)
-# ===========================================================================
-# The old endpoint computed buffers per-machine independently with a fixed
-# formula.  When a facility has a TOTAL BUFFER BUDGET (physical space or
-# WIP capital), we need to decide how to distribute that budget.
-#
-# Model: minimise weighted risk  =  Σ_m  utilisation_m * slack_m
-#   where slack_m = (required_buffer_m − allocated_buffer_m)   (≥ 0)
-#
-# Subject to:
-#   allocated_m  ≤  required_m                    (can't allocate more than needed)
-#   Σ_m  allocated_m  ≤  total_budget            (budget constraint)
-#   allocated_m  ≥  0
-#
-# This ensures high-utilisation machines get buffer first.
 
 def pulp_optimize_buffers(machine_buffer_data, total_budget):
-    """
-    Allocate a finite buffer budget across machines via PuLP LP.
-
-    Parameters
-    ----------
-    machine_buffer_data : list[dict]
-        Each dict must have keys: 'machine', 'required_buffer', 'utilization'
-        (utilization is 0-100 float).
-    total_budget : float
-        Maximum total buffer units available across all machines.
-
-    Returns
-    -------
-    list[dict]  – same dicts enriched with 'allocated_buffer' and 'shortfall'.
-    """
+    """Allocate a finite buffer budget across machines via PuLP LP."""
     if not machine_buffer_data or total_budget <= 0:
         for m in machine_buffer_data:
             m['allocated_buffer'] = 0.0
@@ -574,38 +358,29 @@ def pulp_optimize_buffers(machine_buffer_data, total_budget):
 
     machines = [m['machine'] for m in machine_buffer_data]
 
-    prob = LpProblem("BufferAllocation", LpMinimize)
+    prob  = LpProblem("BufferAllocation", LpMinimize)
+    alloc = {m: LpVariable(f"alloc_{m}", lowBound=0, cat=LpContinuous) for m in machines}
+    slack = {m: LpVariable(f"slack_{m}", lowBound=0, cat=LpContinuous) for m in machines}
 
-    # Decision variables
-    alloc   = {m: LpVariable(f"alloc_{m}", lowBound=0, cat=LpContinuous) for m in machines}
-    slack   = {m: LpVariable(f"slack_{m}", lowBound=0, cat=LpContinuous) for m in machines}
+    req  = {d['machine']: d['required_buffer'] for d in machine_buffer_data}
+    util = {d['machine']: d['utilization']     for d in machine_buffer_data}
 
-    # Lookup helpers
-    req   = {d['machine']: d['required_buffer'] for d in machine_buffer_data}
-    util  = {d['machine']: d['utilization']     for d in machine_buffer_data}
-
-    # Objective: minimise utilisation-weighted shortfall
     prob += lpSum(util[m] * slack[m] for m in machines)
 
-    # Constraints
     for m in machines:
-        # alloc ≤ required
         prob += alloc[m] <= req[m]
-        # slack = required - alloc  (shortfall)
         prob += slack[m] == req[m] - alloc[m]
 
-    # Budget
     prob += lpSum(alloc[m] for m in machines) <= total_budget
 
     prob.solve(_SOLVER)
 
-    # ── Write results back ────────────────────────────────────────────
     for d in machine_buffer_data:
         m = d['machine']
         if LpStatus[prob.status] == "Optimal":
             d['allocated_buffer'] = round(value(alloc[m]), 2)
             d['shortfall']        = round(value(slack[m]),  2)
-        else:                                                # proportional fallback
+        else:
             share                 = req[m] / max(sum(req.values()), 1e-9)
             d['allocated_buffer'] = round(share * total_budget, 2)
             d['shortfall']        = round(max(req[m] - d['allocated_buffer'], 0), 2)
@@ -614,26 +389,302 @@ def pulp_optimize_buffers(machine_buffer_data, total_budget):
 
 
 # ===========================================================================
-# 5.  LEGACY HELPERS  (unchanged – used by optimize_product_batches fallback
-#                       and other parts of the project)
+# 4.  JOB-SHOP SCHEDULER  (Greedy SPT → Left-Shift Compaction → PuLP MILP)
+# ===========================================================================
+
+def run_job_shop_scheduler(
+    products,
+    start_dt: datetime,
+    objective: str = "makespan",
+    batch_override: dict = None,
+    local_opt_machines: int = 5,
+    enable_compaction: bool = True,        # ← NEW: gap elimination flag
+    progress_callback=None,
+) -> list:
+    """
+    Build a job-shop schedule for *products* starting at *start_dt*.
+
+    Phase 1a  –  Greedy SPT dispatcher      (always runs)
+    Phase 1b  –  Left-shift compaction      (runs when enable_compaction=True)
+    Phase 2   –  PuLP local MILP            (runs when local_opt_machines > 0)
+
+    Returns
+    -------
+    list[dict]  – one dict per scheduled operation.
+    """
+    def _progress(pct, msg):
+        if progress_callback:
+            progress_callback(pct, msg)
+
+    _progress(5, "Extracting process routing…")
+
+    # ── 1. Build routing data ─────────────────────────────────────────
+    routing = {}
+    for p in products:
+        steps = (
+            ProcessStep.objects
+            .filter(product=p, cycle_time_seconds__gt=0)
+            .select_related('machine')
+            .order_by('step_number')
+        )
+        if steps.exists():
+            routing[p.pk] = [
+                {
+                    'step':       s.step_number,
+                    'machine':    s.machine.name,
+                    'cycle_sec':  s.cycle_time_seconds,
+                    'step_name':  s.step_name,
+                }
+                for s in steps
+            ]
+
+    _progress(15, "Building job list…")
+
+    # ── 2. Expand into jobs (product × batch) ─────────────────────────
+    jobs    = []
+    job_ops = []
+
+    for p in products:
+        if p.pk not in routing:
+            continue
+
+        if batch_override and p.pk in batch_override:
+            b_size, n_batches = batch_override[p.pk]
+        else:
+            b_size    = p.batch_size  if p.batch_size  > 0 else 1
+            n_batches = p.num_batches if p.num_batches > 0 else 1
+
+        steps = routing[p.pk]
+
+        for b in range(1, n_batches + 1):
+            job_id = f"{p.item}_B{b:03d}"
+            jobs.append({
+                'job_id':       job_id,
+                'product_pk':   p.pk,
+                'product_item': p.item,
+                'batch_num':    b,
+                'batch_size':   b_size,
+                'steps':        steps,
+            })
+
+            for k, s in enumerate(steps):
+                job_ops.append({
+                    'job_id':     job_id,
+                    'product_pk': p.pk,
+                    'batch_num':  b,
+                    'batch_size': b_size,
+                    'step_idx':   k,
+                    'step':       s['step'],
+                    'machine':    s['machine'],
+                    'dur_hours':  (s['cycle_sec'] * b_size) / 3600.0,
+                    'step_name':  s['step_name'],
+                })
+
+    n_machines = len(set(o['machine'] for o in job_ops))
+    _progress(25, f"Scheduling {len(jobs)} jobs across {n_machines} machines…")
+
+    # ── 3. Phase 1a: Greedy SPT dispatcher ────────────────────────────
+    schedule = _greedy_dispatch(jobs, job_ops, start_dt, progress_callback)
+    _progress(55, f"Greedy dispatch complete: {len(schedule):,} operations")
+
+    # ── 4. Phase 1b: Left-shift compaction (gap elimination) ──────────
+    if enable_compaction and schedule:
+        _progress(60, "Eliminating idle gaps (left-shift compaction)…")
+
+        gaps_before = count_schedule_gaps(schedule)
+        schedule    = left_shift_compaction(schedule, max_passes=5)
+        gaps_after  = count_schedule_gaps(schedule)
+
+        _progress(70, (
+            f"Gap elimination done — "
+            f"{gaps_before['total_gaps']} → {gaps_after['total_gaps']} gaps, "
+            f"{gaps_before['total_idle_hours']:.1f}h → "
+            f"{gaps_after['total_idle_hours']:.1f}h idle"
+        ))
+
+    # ── 5. Phase 2: PuLP local optimiser on bottleneck machines ───────
+    if local_opt_machines > 0:
+        _progress(75, f"PuLP optimisation on {local_opt_machines} bottleneck machines…")
+        schedule = _local_pulp_optimise(schedule, job_ops, start_dt, local_opt_machines)
+
+    _progress(95, "Finalising schedule…")
+    return schedule
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a: Greedy SPT dispatcher  (unchanged logic, kept intact)
+# ---------------------------------------------------------------------------
+
+def _greedy_dispatch(jobs, job_ops, start_dt, progress_callback=None):
+    """
+    Classic list-scheduling with Shortest-Processing-Time priority.
+    machine_free[m]  = earliest free time (hours from start_dt)
+    job_ready[job_id] = earliest the next step of this job can start
+    """
+    machine_free  = defaultdict(float)
+    job_ready     = defaultdict(float)
+
+    ops_by_job = defaultdict(list)
+    for op in job_ops:
+        ops_by_job[op['job_id']].append(op)
+    for jid in ops_by_job:
+        ops_by_job[jid].sort(key=lambda o: o['step_idx'])
+
+    max_steps = max((len(v) for v in ops_by_job.values()), default=0)
+
+    schedule = []
+
+    for step_idx in range(max_steps):
+        round_ops = [
+            ops_by_job[jid][step_idx]
+            for jid in ops_by_job
+            if step_idx < len(ops_by_job[jid])
+        ]
+        round_ops.sort(key=lambda o: o['dur_hours'])
+
+        for op in round_ops:
+            jid     = op['job_id']
+            machine = op['machine']
+            dur     = op['dur_hours']
+
+            start_hrs = max(machine_free[machine], job_ready[jid])
+            end_hrs   = start_hrs + dur
+
+            machine_free[machine] = end_hrs
+            job_ready[jid]        = end_hrs
+
+            schedule.append({
+                'job_id':       jid,
+                'product_pk':   op['product_pk'],
+                'batch_num':    op['batch_num'],
+                'batch_size':   op['batch_size'],
+                'step_number':  op['step'],
+                'step_name':    op['step_name'],
+                'machine_name': machine,
+                'start_hrs':    start_hrs,
+                'end_hrs':      end_hrs,
+                'dur_hours':    dur,
+                'start_dt':     start_dt + timedelta(hours=start_hrs),
+                'end_dt':       start_dt + timedelta(hours=end_hrs),
+                'batch_id':     jid,
+            })
+
+    return schedule
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Bounded PuLP optimisation on bottleneck machines  (unchanged)
+# ---------------------------------------------------------------------------
+
+def _local_pulp_optimise(schedule, job_ops, start_dt, k_machines):
+    """Re-optimise the K most-loaded machines using single-machine MILP."""
+    machine_load = defaultdict(float)
+    for row in schedule:
+        machine_load[row['machine_name']] += row['dur_hours']
+
+    top_machines = sorted(machine_load, key=machine_load.get, reverse=True)[:k_machines]
+
+    by_machine = defaultdict(list)
+    for i, row in enumerate(schedule):
+        by_machine[row['machine_name']].append(i)
+
+    for machine in top_machines:
+        indices = by_machine[machine]
+        if len(indices) < 2:
+            continue
+        if len(indices) > 200:
+            indices.sort(key=lambda i: schedule[i]['start_hrs'])
+            continue
+        _reoptimise_machine(schedule, indices, machine, start_dt)
+
+    return schedule
+
+
+def _reoptimise_machine(schedule, indices, machine_name, start_dt):
+    """Single-machine MILP: minimise makespan for one machine's operations."""
+    n   = len(indices)
+    ops = [schedule[i] for i in indices]
+
+    lb        = [max(0.0, op['start_hrs'] - op['dur_hours']) for op in ops]
+    ub_global = max(op['end_hrs'] for op in ops) * 1.5
+    durations = [op['dur_hours'] for op in ops]
+
+    prob = LpProblem(f"SingleMachine_{machine_name}", LpMinimize)
+    S    = [LpVariable(f"S_{i}", lowBound=lb[i], upBound=ub_global) for i in range(n)]
+    Cmax = LpVariable("Cmax", lowBound=0)
+
+    prob += Cmax
+
+    for i in range(n):
+        prob += Cmax >= S[i] + durations[i]
+
+    M = ub_global
+    for i in range(n):
+        for j in range(i + 1, n):
+            y = LpVariable(f"y_{i}_{j}", cat=LpBinary)
+            prob += S[j] >= S[i] + durations[i] - M * (1 - y)
+            prob += S[i] >= S[j] + durations[j] - M * y
+
+    prob.solve(_SOLVER_TIMED)
+
+    if LpStatus[prob.status] == "Optimal":
+        for idx_in_ops, orig_idx in enumerate(indices):
+            new_start = value(S[idx_in_ops])
+            new_end   = new_start + durations[idx_in_ops]
+            schedule[orig_idx]['start_hrs'] = new_start
+            schedule[orig_idx]['end_hrs']   = new_end
+            schedule[orig_idx]['start_dt']  = start_dt + timedelta(hours=new_start)
+            schedule[orig_idx]['end_dt']    = start_dt + timedelta(hours=new_end)
+
+
+# ---------------------------------------------------------------------------
+# KPI helpers
+# ---------------------------------------------------------------------------
+
+def compute_schedule_kpis(schedule_rows, makespan_hours):
+    """Compute summary KPIs from a list of schedule dicts."""
+    if not schedule_rows:
+        return {}
+
+    machine_used = defaultdict(float)
+    machine_ops  = defaultdict(int)
+
+    for row in schedule_rows:
+        machine_used[row['machine_name']] += row['dur_hours']
+        machine_ops[row['machine_name']]  += 1
+
+    utilisation = {
+        m: round(machine_used[m] / makespan_hours * 100, 2) if makespan_hours > 0 else 0
+        for m in machine_used
+    }
+
+    bottleneck = max(utilisation, key=utilisation.get) if utilisation else None
+
+    return {
+        'makespan_hours':     round(makespan_hours, 2),
+        'makespan_days':      round(makespan_hours / 24, 2),
+        'total_operations':   len(schedule_rows),
+        'machines_used':      len(machine_used),
+        'utilisation':        utilisation,
+        'bottleneck_machine': bottleneck,
+        'bottleneck_util':    utilisation.get(bottleneck, 0) if bottleneck else 0,
+    }
+
+
+# ===========================================================================
+# 5.  LEGACY HELPERS  (unchanged)
 # ===========================================================================
 
 def optimize_product_batches(products, max_num_batches, min_batch_size, max_batch_size):
-    """
-    Per-product batch optimisation (calls the PuLP single-product ILP).
-    Kept as the fallback when the joint model fails.
-    """
+    """Per-product batch optimisation (calls the PuLP single-product ILP)."""
     batch_optimization_log = []
-
     for product in products:
         batch_size, num_batches, ideal_batch = calculate_optimal_batch_size(
             product.demand_2024, max_num_batches, min_batch_size, max_batch_size
         )
-
         product.batch_size  = batch_size
         product.num_batches = num_batches
         product.save()
-
         batch_optimization_log.append({
             'item':             product.item,
             'demand':           product.demand_2024,
@@ -641,19 +692,16 @@ def optimize_product_batches(products, max_num_batches, min_batch_size, max_batc
             'num_batches':      num_batches,
             'ideal_batch_size': round(ideal_batch, 2)
         })
-
     return batch_optimization_log
 
 
 def calculate_kpis(schedule_records, machine_availability):
-    """
-    Calculate high-level scheduling KPIs.  (Unchanged logic.)
-    """
+    """Calculate high-level scheduling KPIs."""
     if not schedule_records:
         return {}
 
-    max_end   = max(s.end_time   for s in schedule_records)
-    min_start = min(s.start_time for s in schedule_records)
+    max_end        = max(s.end_time   for s in schedule_records)
+    min_start      = min(s.start_time for s in schedule_records)
     makespan_hours = (max_end - min_start).total_seconds() / 3600
     makespan_days  = makespan_hours / 24
 
@@ -662,11 +710,10 @@ def calculate_kpis(schedule_records, machine_availability):
         used_hours = ProductionSchedule.objects.filter(
             machine__name=machine_name
         ).aggregate(total=Sum('duration_hours'))['total'] or 0
-
         utilization = (used_hours / makespan_hours * 100) if makespan_hours > 0 else 0
         machine_stats[machine_name] = {
-            'used_hours':   round(used_hours, 2),
-            'utilization':  round(utilization, 2)
+            'used_hours':  round(used_hours, 2),
+            'utilization': round(utilization, 2)
         }
 
     total_units = Product.objects.filter(demand_2024__gt=0).aggregate(
@@ -697,7 +744,6 @@ def get_batch_params(request):
 # ===========================================================================
 
 def build_summary(df):
-    """Build final summary metrics table."""
     return {
         "Metric": ["Target Headcount", "Actual Headcount", "Current Backlog", "Currently Open"],
         "Finished Goods": [
@@ -716,10 +762,8 @@ def build_summary(df):
 
 
 def calculate_production_outputs(df, finished_filter, connector_filter):
-    """Calculate shift-wise production outputs."""
     fg_output   = {}
     conn_output = {}
-
     for i, shift in enumerate(SHIFT_LABELS):
         col_idx = 14 + i
         if col_idx < 50:
@@ -727,37 +771,26 @@ def calculate_production_outputs(df, finished_filter, connector_filter):
             conn = df.iloc[:, col_idx][connector_filter].sum()
         else:
             fg = conn = 0
-
-        fg_output[shift]   = f"{fg:,.0f}" if fg > 0 else "0"
+        fg_output[shift]   = f"{fg:,.0f}"   if fg   > 0 else "0"
         conn_output[shift] = f"{conn:,.0f}" if conn > 0 else "0"
-
     return fg_output, conn_output
 
 
 def calculate_backlog(df):
-    """Calculate backlog per shift."""
-    backlog_cols    = range(95, 113)
-    backlog_values  = []
-
+    backlog_cols   = range(95, 113)
+    backlog_values = []
     for idx in backlog_cols:
         total = df.iloc[2:264, idx]
         total = total.loc[total > 0].sum()
         backlog_values.append(total if total > 0 else 0)
-
     result = []
     for val in backlog_values:
         result.extend([val, 0])
-
     return (result + [0] * len(SHIFT_LABELS))[:len(SHIFT_LABELS)]
 
 
 def calculate_efficiency(df, num_shifts):
-    """
-    Calculate overall efficiency per shift.
-    Efficiency = (Planned Production Time / Available Time) * 100
-    """
     efficiency_list = []
-
     if 'STD' not in df.columns:
         return [0] * 36
 
@@ -777,31 +810,26 @@ def calculate_efficiency(df, num_shifts):
             .str.replace(r'[^\d\.\-]', '', regex=True),
             errors='coerce'
         )
-
         valid           = quantity.notna() & std_col.notna()
         planned_minutes = (quantity[valid] * std_col[valid]).sum()
         planned_hours   = planned_minutes / 60
-
-        efficiency = (planned_hours / available_time) * 100 if available_time else 0
+        efficiency      = (planned_hours / available_time) * 100 if available_time else 0
         efficiency_list.append(efficiency)
 
     result = []
     for val in efficiency_list:
         result.extend([val, 0])
-
     return (result + [0] * 36)[:36]
 
 
 def apply_filters(df, filters):
-    """Apply optional column filters to the dataframe."""
-    for column, value in filters.items():
-        if value != "All" and column in df.columns:
-            df = df[df[column] == value]
+    for column, val in filters.items():
+        if val != "All" and column in df.columns:
+            df = df[df[column] == val]
     return df
 
 
 def clean_numeric_columns(df, columns):
-    """Convert specified columns to numeric."""
     for col in columns:
         if col in df.columns:
             df[col] = pd.to_numeric(
@@ -811,26 +839,22 @@ def clean_numeric_columns(df, columns):
 
 
 def clean_text_columns(df, columns):
-    """Strip whitespace from specified text columns."""
     for col in columns:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
 
 
 def clean_shift_columns(df, column_ranges):
-    """Clean numeric shift-based columns using column index ranges."""
     for start, end in column_ranges:
         for idx in range(start, end):
             df.iloc[:, idx] = pd.to_numeric(
-                df.iloc[:, idx]
-                .astype(str)
+                df.iloc[:, idx].astype(str)
                 .str.replace(r'[^\d\.\-]', '', regex=True),
                 errors='coerce'
             )
 
 
 def process_frontpage_data(frontpage_df):
-    """Process frontpage CSV data."""
     df = frontpage_df.rename(columns={
         'SAP TN': 'SAP_TN', 'SAP PL': 'SAP_PL', 'DCC Type': 'DCC_Type'
     })
@@ -848,13 +872,11 @@ def process_frontpage_data(frontpage_df):
             .astype('Int64')
         )
 
-    # df = df.head(5)
     df = df.where(pd.notna(df), None)
     return df.to_dict(orient='list')
 
 
 def process_routing_data(process_df):
-    """Process routing CSV data."""
     process_routing = []
 
     machines = (
