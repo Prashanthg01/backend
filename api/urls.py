@@ -7,10 +7,19 @@ from .views import (
     get_buffer_optimization, get_bottleneck_analysis,
     get_batch_optimization_preview,
     get_schedule_gantt,
-    gap_analysis,                   # ← NEW
+    gap_analysis,
+    schedule_comparison,
+    optimize_schedule_preview,
+    optimize_schedule_save,
 )
+from .auth_views import login, logout, me
 
 urlpatterns = [
+    # Auth (login is AllowAny; logout/me require token)
+    path('auth/login/', login, name='auth_login'),
+    path('auth/logout/', logout, name='auth_logout'),
+    path('auth/me/', me, name='auth_me'),
+
     path('process-csv/', process_csv, name='process_csv'),
     path('get-filter-options/', get_filter_options, name='get_filter_options'),
     path('kpis/', get_kpis, name='get_kpis'),
@@ -24,5 +33,8 @@ urlpatterns = [
     path('generate-schedule/', generate_schedule, name='generate_schedule'),
     path('get-schedule/', get_schedule, name='get_schedule'),
     path('schedule-gantt/', get_schedule_gantt, name='schedule_gantt'),
-    path('gap-analysis/', gap_analysis, name='gap_analysis'),              # ← NEW
+    path('gap-analysis/', gap_analysis, name='gap_analysis'),
+    path('schedule-comparison/', schedule_comparison, name='schedule_comparison'),
+    path('optimize-schedule-preview/', optimize_schedule_preview, name='optimize_schedule_preview'),
+    path('optimize-schedule/', optimize_schedule_save, name='optimize_schedule_save'),
 ]

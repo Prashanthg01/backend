@@ -81,10 +81,21 @@ def process_csv(request):
 
 @api_view(['GET'])
 def get_filter_options(request):
-    """Get available filter options (machines, products, date range) from DB."""
+    """Get available filter options (machines, products, date range, dcc_types) from DB."""
     try:
-        machines = Machine.objects.all().values_list('name', flat=True)
-        products = Product.objects.filter(demand_2024__gt=0).values('item', 'description')
+        machines = list(Machine.objects.all().values_list('name', flat=True))
+        products = list(
+            Product.objects.filter(demand_2024__gt=0).values(
+                'item', 'description', 'dcc_type', 'demand_2024', 'batch_size', 'num_batches'
+            )
+        )
+        dcc_types = list(
+            Product.objects.filter(demand_2024__gt=0)
+            .values_list('dcc_type', flat=True)
+            .distinct()
+            .order_by('dcc_type')
+        )
+        dcc_types = [t for t in dcc_types if t]
 
         schedules = ProductionSchedule.objects.all()
         if schedules.exists():
@@ -94,8 +105,9 @@ def get_filter_options(request):
             min_date = max_date = None
 
         return Response({
-            'machines':   list(machines),
-            'products':   list(products),
+            'machines':   machines,
+            'products':   products,
+            'dcc_types':  dcc_types,
             'date_range': {'min': min_date, 'max': max_date}
         }, status=status.HTTP_200_OK)
 
@@ -630,18 +642,90 @@ def generate_schedule(request):
 
 @api_view(['GET'])
 def get_schedule(request):
-    """Retrieve persisted schedule records with optional filters."""
+    """Retrieve persisted schedule records with optional filters.
+    Query params: machine, product, machines (comma-separated), products (comma-separated item ids),
+    start, end (ISO date or datetime), batch_size_min, batch_size_max, duration_min, duration_max, step.
+    """
     try:
         schedules = ProductionSchedule.objects.select_related(
             'machine', 'product', 'process_step'
         ).order_by('start_time', 'machine')
 
+        # Single machine/product (backward compatible)
         machine_filter = request.GET.get('machine')
         product_filter = request.GET.get('product')
         if machine_filter:
             schedules = schedules.filter(machine__name__icontains=machine_filter)
         if product_filter:
-            schedules = schedules.filter(product__item=product_filter)
+            try:
+                schedules = schedules.filter(product__item=int(product_filter))
+            except (ValueError, TypeError):
+                pass
+
+        # Multi machine/product
+        machines_param = request.GET.get('machines')
+        if machines_param:
+            names = [m.strip() for m in machines_param.split(',') if m.strip()]
+            if names:
+                schedules = schedules.filter(machine__name__in=names)
+        products_param = request.GET.get('products')
+        if products_param:
+            try:
+                items = [int(x.strip()) for x in products_param.split(',') if x.strip()]
+                if items:
+                    schedules = schedules.filter(product__item__in=items)
+            except (ValueError, TypeError):
+                pass
+
+        # Date range (start_time/end_time)
+        start_param = request.GET.get('start')
+        end_param = request.GET.get('end')
+        if start_param:
+            schedules = schedules.filter(start_time__gte=start_param)
+        if end_param:
+            schedules = schedules.filter(end_time__lte=end_param)
+
+        # Batch size range
+        batch_min = request.GET.get('batch_size_min')
+        batch_max = request.GET.get('batch_size_max')
+        if batch_min is not None and batch_min != '':
+            try:
+                schedules = schedules.filter(batch_size__gte=int(batch_min))
+            except (ValueError, TypeError):
+                pass
+        if batch_max is not None and batch_max != '':
+            try:
+                schedules = schedules.filter(batch_size__lte=int(batch_max))
+            except (ValueError, TypeError):
+                pass
+
+        # Duration range (hours)
+        dur_min = request.GET.get('duration_min')
+        dur_max = request.GET.get('duration_max')
+        if dur_min is not None and dur_min != '':
+            try:
+                schedules = schedules.filter(duration_hours__gte=float(dur_min))
+            except (ValueError, TypeError):
+                pass
+        if dur_max is not None and dur_max != '':
+            try:
+                schedules = schedules.filter(duration_hours__lte=float(dur_max))
+            except (ValueError, TypeError):
+                pass
+
+        # Process step number
+        step_param = request.GET.get('step')
+        if step_param is not None and step_param != '':
+            try:
+                step_num = int(step_param)
+                schedules = schedules.filter(process_step__step_number=step_num)
+            except (ValueError, TypeError):
+                pass
+
+        # DCC type (product level)
+        dcc_param = request.GET.get('dcc_type')
+        if dcc_param and dcc_param.strip():
+            schedules = schedules.filter(product__dcc_type=dcc_param.strip())
 
         total_count = schedules.count()
         page_size   = min(int(request.GET.get('page_size', 200)), 1000)
