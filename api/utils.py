@@ -976,6 +976,7 @@ def clean_shift_columns(df, column_ranges):
 
 
 def process_frontpage_data(frontpage_df):
+    frontpage_df = frontpage_df.head(3)
     df = frontpage_df.rename(columns={
         'SAP TN': 'SAP_TN', 'SAP PL': 'SAP_PL', 'DCC Type': 'DCC_Type'
     })
