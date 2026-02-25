@@ -13,6 +13,8 @@ from .utils import (
     process_routing_data,
     run_job_shop_scheduler,
     compute_schedule_kpis,
+    optimize_product_batches_jointly,
+    calculate_optimal_batch_size
 )
 import traceback
 
@@ -108,82 +110,82 @@ def initialize_data_task(self, frontpage_csv_path, process_csv_path):
         return {'status': 'error', 'message': str(e), 'traceback': error_trace}
 
 
-@shared_task(bind=True, name='batch_optimize_preview_task')
+@shared_task(bind=True, name="batch_optimize_preview_task")
 def batch_optimize_preview_task(self, params):
-    """Background task for batch optimization preview."""
+    """Background task for individual batch optimization preview."""
     try:
-        from .utils import calculate_optimal_batch_size
+        self.update_state(state="PROGRESS", meta={"progress": 10, "status": "Loading products"})
 
-        self.update_state(state='PROGRESS', meta={'progress': 10, 'status': 'Loading products'})
-
-        products        = Product.objects.filter(demand_2024__gt=0)
-        batch_analysis  = []
-        total_demand    = 0
-        total_batches   = 0
-        batch_sizes     = []
-        total_products  = products.count()
+        products       = Product.objects.filter(demand_2024__gt=0)
+        batch_analysis = []
+        total_demand   = 0
+        total_batches  = 0
+        batch_sizes    = []
+        total_products = products.count()
 
         for idx, product in enumerate(products):
             if idx % 10 == 0:
                 progress = 10 + int((idx / total_products) * 80)
-                self.update_state(state='PROGRESS', meta={
-                    'progress': progress,
-                    'status':   f'Analyzing products ({idx}/{total_products})'
+                self.update_state(state="PROGRESS", meta={
+                    "progress": progress,
+                    "status":   f"Analyzing products ({idx}/{total_products})",
                 })
 
-            demand = product.demand_2024
+            demand = int(product.demand_2024)
             batch_size, num_batches, ideal_batch = calculate_optimal_batch_size(
                 demand,
-                params['max_num_batches'],
-                params['min_batch_size'],
-                params['max_batch_size']
+                params["max_num_batches"],
+                params["min_batch_size"],
+                params["max_batch_size"],
             )
 
-            old_batch_size  = int(np.ceil(demand / 12))
-            old_num_batches = 12
+            old_batch_size  = product.batch_size
+            old_num_batches = product.num_batches
+
+            improvement = (
+                f"{((old_num_batches - num_batches) / old_num_batches * 100):.1f}%"
+                if old_num_batches and old_num_batches != num_batches else "0%"
+            )
 
             batch_analysis.append({
-                'item':             product.item,
-                'description':      product.description[:50],
-                'demand':           demand,
-                'old_batch_size':   old_batch_size,
-                'old_num_batches':  old_num_batches,
-                'new_batch_size':   batch_size,
-                'new_num_batches':  num_batches,
-                'ideal_batch_size': round(ideal_batch, 2),
-                'improvement':      (
-                    f"{((old_num_batches - num_batches) / old_num_batches * 100):.1f}%"
-                    if old_num_batches != num_batches else "0%"
-                ),
+                "item":             product.item,
+                "description":      (product.description or "")[:50],
+                "demand":           demand,
+                "old_batch_size":   old_batch_size,
+                "old_num_batches":  old_num_batches,
+                "new_batch_size":   batch_size,
+                "new_num_batches":  num_batches,
+                "ideal_batch_size": round(ideal_batch, 2),
+                "improvement":      improvement,
             })
-
             total_demand  += demand
             total_batches += num_batches
             batch_sizes.append(batch_size)
 
-        self.update_state(state='PROGRESS', meta={'progress': 100, 'status': 'Complete'})
+        self.update_state(state="PROGRESS", meta={"progress": 100, "status": "Complete"})
 
         return {
-            'status':         'success',
-            'batch_analysis': batch_analysis,
-            'summary': {
-                'total_products': len(batch_analysis),
-                'total_demand':   total_demand,
-                'total_batches':  total_batches,
-                'avg_batch_size': round(np.mean(batch_sizes), 2) if batch_sizes else 0,
-                'min_batch_size': int(np.min(batch_sizes))       if batch_sizes else 0,
-                'max_batch_size': int(np.max(batch_sizes))       if batch_sizes else 0,
-                'std_batch_size': round(np.std(batch_sizes), 2)  if batch_sizes else 0,
+            "status":         "success",
+            "batch_analysis": batch_analysis,
+            "summary": {
+                "total_products": len(batch_analysis),
+                "total_demand":   total_demand,
+                "total_batches":  total_batches,
+                "avg_batch_size": round(np.mean(batch_sizes), 2) if batch_sizes else 0,
+                "min_batch_size": int(np.min(batch_sizes))       if batch_sizes else 0,
+                "max_batch_size": int(np.max(batch_sizes))       if batch_sizes else 0,
+                "std_batch_size": round(np.std(batch_sizes), 2)  if batch_sizes else 0,
             },
-            'parameters': params
+            "parameters": params,
         }
 
     except Exception as e:
         return {
-            'status':    'error',
-            'message':   str(e),
-            'traceback': traceback.format_exc()
+            "status":    "error",
+            "message":   str(e),
+            "traceback": traceback.format_exc(),
         }
+    
 
 
 @shared_task(bind=True, name='generate_schedule_task')
@@ -306,3 +308,178 @@ def generate_schedule_task(self, params: dict):
             meta={'progress': 0, 'status': 'Failed', 'error': str(exc)}
         )
         return {'status': 'error', 'message': str(exc), 'traceback': tb}
+    
+
+
+
+@shared_task(bind=True, name="batch_optimize_save_task")
+def batch_optimize_save_task(self, params):
+    """Background task to apply optimized batch sizes to all products."""
+    try:
+        self.update_state(state="PROGRESS", meta={"progress": 10, "status": "Loading products"})
+
+        products       = Product.objects.filter(demand_2024__gt=0)
+        total_products = products.count()
+        updated        = []
+        skipped        = []
+
+        for idx, product in enumerate(products):
+            if idx % 10 == 0:
+                progress = 10 + int((idx / total_products) * 80)
+                self.update_state(state="PROGRESS", meta={
+                    "progress": progress,
+                    "status":   f"Optimizing products ({idx}/{total_products})",
+                })
+
+            demand = int(product.demand_2024)
+            batch_size, num_batches, _ = calculate_optimal_batch_size(
+                demand,
+                params["max_num_batches"],
+                params["min_batch_size"],
+                params["max_batch_size"],
+            )
+
+            if batch_size == 0:
+                skipped.append(product.item)
+                continue
+
+            if product.batch_size != batch_size or product.num_batches != num_batches:
+                old_bs = product.batch_size
+                old_nb = product.num_batches
+                product.batch_size  = batch_size
+                product.num_batches = num_batches
+                product.save(update_fields=["batch_size", "num_batches"])
+                updated.append({
+                    "item":             product.item,
+                    "old_batch_size":   old_bs,
+                    "old_num_batches":  old_nb,
+                    "new_batch_size":   batch_size,
+                    "new_num_batches":  num_batches,
+                })
+
+        self.update_state(state="PROGRESS", meta={"progress": 100, "status": "Complete"})
+
+        return {
+            "status":           "success",
+            "message":          "Batch optimization applied successfully",
+            "total_updated":    len(updated),
+            "total_skipped":    len(skipped),
+            "updated_products": updated,
+            "skipped_items":    skipped,
+            "parameters":       params,
+        }
+
+    except Exception as e:
+        return {
+            "status":    "error",
+            "message":   str(e),
+            "traceback": traceback.format_exc(),
+        }
+
+@shared_task(bind=True, name="joint_optimize_task")
+def joint_optimize_task(self, params, save_to_db: bool = True):
+    """
+    Celery task for joint multi-product batch optimization.
+
+    Runs the full MILP that balances machine loads across all products
+    simultaneously. Optionally saves results to DB.
+
+    Progress states:
+      10% — Loading products & routing data
+      20% — Building MILP model
+      60% — Solving (CBC solver running)
+      90% — Extracting results
+     100% — Done
+    """
+    try:
+        self.update_state(state="PROGRESS", meta={
+            "progress": 10,
+            "status":   "Loading products and routing data",
+        })
+
+        products = list(
+            Product.objects.filter(demand_2024__gt=0).prefetch_related(
+                "processstep_set__machine"
+            )
+        )
+
+        self.update_state(state="PROGRESS", meta={
+            "progress": 20,
+            "status":   f"Building joint MILP for {len(products)} products",
+        })
+
+        if save_to_db:
+            # Full run — saves to DB inside optimize_product_batches_jointly
+            result = optimize_product_batches_jointly(
+                products,
+                params["max_num_batches"],
+                params["min_batch_size"],
+                params["max_batch_size"],
+                time_limit_seconds=180,
+            )
+        else:
+            # Preview-only — use the no-save helper from views
+            from .views import _joint_preview_no_save
+            result = _joint_preview_no_save(
+                products,
+                params["max_num_batches"],
+                params["min_batch_size"],
+                params["max_batch_size"],
+            )
+
+        self.update_state(state="PROGRESS", meta={"progress": 100, "status": "Complete"})
+
+        # Build summary for task result
+        results_list = result.get("results", [])
+        batch_sizes  = [r["new_batch_size"]  for r in results_list if r.get("demand", 0) > 0]
+        improvements = []
+        for r in results_list:
+            try:
+                improvements.append(float(r["improvement"].replace("%", "")))
+            except (ValueError, AttributeError):
+                improvements.append(0.0)
+
+        return {
+            "status":           "success",
+            "solver_status":    result["status"],
+            "message":          result["message"],
+            "batch_analysis":   results_list,
+            "machine_loads":    result["machine_loads"],
+            "makespan_proxy":   result["makespan_proxy"],
+            "products_updated": result.get("products_updated", 0),
+            "summary": {
+                "total_products":    len(results_list),
+                "total_demand":      sum(r["demand"] for r in results_list),
+                "total_batches":     sum(r["new_num_batches"] for r in results_list
+                                        if r.get("demand", 0) > 0),
+                "avg_batch_size":    round(import_mean(batch_sizes), 1) if batch_sizes else 0,
+                "avg_improvement":   round(import_mean(improvements), 1) if improvements else 0,
+                "load_balance_score": _load_balance_score(result["machine_loads"]),
+            },
+            "parameters": params,
+        }
+
+    except Exception as e:
+        return {
+            "status":    "error",
+            "message":   str(e),
+            "traceback": traceback.format_exc(),
+        }
+
+
+# ── tiny helpers ──────────────────────────────────────────────────────────────
+
+def import_mean(lst):
+    return sum(lst) / len(lst) if lst else 0
+
+
+def _load_balance_score(machine_loads: dict) -> float:
+    """0–100 score: 100 = perfectly balanced, 0 = all load on one machine."""
+    vals = list(machine_loads.values())
+    if not vals or max(vals) == 0:
+        return 100.0
+    return round(
+        (1 - (max(vals) - min(vals)) / (max(vals) + 1e-9)) * 100, 1
+    )
+
+

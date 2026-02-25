@@ -12,6 +12,7 @@ from celery.result import AsyncResult
 from collections import defaultdict
 import os
 import tempfile
+import traceback
 
 from .models import Product, Machine, ProcessStep, ProductionSchedule
 from .utils import (
@@ -20,11 +21,14 @@ from .utils import (
     calculate_production_outputs, SHIFT_LABELS, build_summary,
     process_frontpage_data, process_routing_data,
     calculate_optimal_batch_size, pulp_optimize_buffers,
+    optimize_product_batches_jointly
 )
 from .tasks import (
     initialize_data_task,
     generate_schedule_task,
     batch_optimize_preview_task,
+    batch_optimize_save_task,
+    joint_optimize_task
 )
 
 _preview_cache = {}
@@ -483,30 +487,37 @@ def get_bottleneck_analysis(request):
 # BATCH OPTIMISATION PREVIEW
 # ===========================================================================
 
-@api_view(['GET'])
-def get_batch_optimization_preview(request):
-    """Preview batch-size optimization for every product (supports async)."""
-    try:
-        max_num_batches = int(request.GET.get('max_num_batches', 25))
-        min_batch_size  = int(request.GET.get('min_batch_size',  50))
-        max_batch_size  = int(request.GET.get('max_batch_size', 500))
-        async_mode      = request.GET.get('async_mode', 'false').lower() == 'true'
+def _build_params(request_obj, is_post=False):
+    """Extract and validate optimization parameters from GET or POST."""
+    getter = request_obj.data if is_post else request_obj.GET
+    return {
+        "max_num_batches": int(getter.get("max_num_batches", 25)),
+        "min_batch_size":  int(getter.get("min_batch_size",  50)),
+        "max_batch_size":  int(getter.get("max_batch_size",  500)),
+    }
 
-        params = {
-            'max_num_batches': max_num_batches,
-            'min_batch_size':  min_batch_size,
-            'max_batch_size':  max_batch_size,
-        }
+
+@api_view(["GET"])
+def get_batch_optimization_preview(request):
+    """
+    Preview batch-size optimization for every product (supports async).
+
+    Fix: adaptive bounds applied per product so the ILP is always feasible.
+    """
+    try:
+        params     = _build_params(request)
+        async_mode = request.GET.get("async_mode", "false").lower() == "true"
 
         if async_mode:
             task = batch_optimize_preview_task.delay(params)
             return Response({
-                'task_id':          task.id,
-                'status':           'processing',
-                'message':          'Batch optimization preview started in background',
-                'check_status_url': f'/api/task-status/{task.id}/'
+                "task_id":          task.id,
+                "status":           "processing",
+                "message":          "Batch optimization preview started in background",
+                "check_status_url": f"/api/task-status/{task.id}/",
             }, status=status.HTTP_202_ACCEPTED)
 
+        # ── Sync ──────────────────────────────────────────────────────────────
         products       = Product.objects.filter(demand_2024__gt=0)
         batch_analysis = []
         total_demand   = 0
@@ -514,48 +525,67 @@ def get_batch_optimization_preview(request):
         batch_sizes    = []
 
         for product in products:
-            demand = product.demand_2024
+            demand = int(product.demand_2024)
+
             batch_size, num_batches, ideal_batch = calculate_optimal_batch_size(
-                demand, max_num_batches, min_batch_size, max_batch_size
+                demand,
+                params["max_num_batches"],
+                params["min_batch_size"],
+                params["max_batch_size"],
             )
-            old_batch_size  = int(np.ceil(demand / 12))
-            old_num_batches = 12
+
+            old_batch_size  = product.batch_size   # actual DB value (not re-computed)
+            old_num_batches = product.num_batches
+
+            improvement = (
+                f"{((old_num_batches - num_batches) / old_num_batches * 100):.1f}%"
+                if old_num_batches and old_num_batches != num_batches else "0%"
+            )
 
             batch_analysis.append({
-                'item':             product.item,
-                'description':      product.description[:50],
-                'demand':           demand,
-                'old_batch_size':   old_batch_size,
-                'old_num_batches':  old_num_batches,
-                'new_batch_size':   batch_size,
-                'new_num_batches':  num_batches,
-                'ideal_batch_size': round(ideal_batch, 2),
-                'improvement':      (
-                    f"{((old_num_batches - num_batches) / old_num_batches * 100):.1f}%"
-                    if old_num_batches != num_batches else "0%"
+                "item":             product.item,
+                "description":      (product.description or "")[:50],
+                "demand":           demand,
+                "old_batch_size":   old_batch_size,
+                "old_num_batches":  old_num_batches,
+                "new_batch_size":   batch_size,
+                "new_num_batches":  num_batches,
+                "ideal_batch_size": round(ideal_batch, 2),
+                "improvement":      improvement,
+                # NEW: surface the effective bounds so UI can explain them
+                "effective_min_batch": max(
+                    params["min_batch_size"],
+                    -(-demand // params["max_num_batches"])   # ceil
                 ),
+                "effective_max_batch": min(params["max_batch_size"], demand)
+                    if params["max_batch_size"] <= demand else demand,
             })
+
             total_demand  += demand
             total_batches += num_batches
             batch_sizes.append(batch_size)
 
         return Response({
-            'batch_analysis': batch_analysis,
-            'summary': {
-                'total_products': len(batch_analysis),
-                'total_demand':   total_demand,
-                'total_batches':  total_batches,
-                'avg_batch_size': round(np.mean(batch_sizes), 2) if batch_sizes else 0,
-                'min_batch_size': int(np.min(batch_sizes))       if batch_sizes else 0,
-                'max_batch_size': int(np.max(batch_sizes))       if batch_sizes else 0,
-                'std_batch_size': round(np.std(batch_sizes), 2)  if batch_sizes else 0,
+            "batch_analysis": batch_analysis,
+            "summary": {
+                "total_products": len(batch_analysis),
+                "total_demand":   total_demand,
+                "total_batches":  total_batches,
+                "avg_batch_size": round(np.mean(batch_sizes), 2) if batch_sizes else 0,
+                "min_batch_size": int(np.min(batch_sizes))       if batch_sizes else 0,
+                "max_batch_size": int(np.max(batch_sizes))       if batch_sizes else 0,
+                "std_batch_size": round(np.std(batch_sizes), 2)  if batch_sizes else 0,
+                "note": (
+                    "Bounds are applied adaptively per product. "
+                    "For small demands the max bound is clamped to the demand; "
+                    "for large demands the min bound is raised to ceil(demand/max_batches)."
+                ),
             },
-            'parameters': params
+            "parameters": params,
         }, status=status.HTTP_200_OK)
 
     except Exception as e:
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # ===========================================================================
 # GENERATE SCHEDULE
@@ -1078,3 +1108,177 @@ def optimize_schedule_save(request):
     request.data['clear_existing']     = True
     request.data['local_opt_machines'] = int(request.data.get('local_opt_machines', 5))
     return generate_schedule(request)
+
+
+@api_view(["POST"])
+def save_batch_optimization(request):
+    """Apply optimized batch sizes to all products and save to DB."""
+    try:
+        params     = _build_params(request, is_post=True)
+        async_mode = request.data.get("async_mode", "false").lower() == "true"
+
+        if async_mode:
+            task = batch_optimize_save_task.delay(params)
+            return Response({
+                "task_id":          task.id,
+                "status":           "processing",
+                "message":          "Batch optimization save started in background",
+                "check_status_url": f"/api/task-status/{task.id}/",
+            }, status=status.HTTP_202_ACCEPTED)
+
+        products = Product.objects.filter(demand_2024__gt=0)
+        updated  = []
+        skipped  = []
+
+        for product in products:
+            demand = int(product.demand_2024)
+            batch_size, num_batches, _ = calculate_optimal_batch_size(
+                demand,
+                params["max_num_batches"],
+                params["min_batch_size"],
+                params["max_batch_size"],
+            )
+
+            if batch_size == 0:
+                skipped.append(product.item)
+                continue
+
+            if product.batch_size != batch_size or product.num_batches != num_batches:
+                old_bs = product.batch_size
+                old_nb = product.num_batches
+                product.batch_size  = batch_size
+                product.num_batches = num_batches
+                product.save(update_fields=["batch_size", "num_batches"])
+                updated.append({
+                    "item":             product.item,
+                    "old_batch_size":   old_bs,
+                    "old_num_batches":  old_nb,
+                    "new_batch_size":   batch_size,
+                    "new_num_batches":  num_batches,
+                })
+
+        return Response({
+            "message":          "Batch optimization applied successfully",
+            "total_updated":    len(updated),
+            "total_skipped":    len(skipped),
+            "updated_products": updated,
+            "skipped_items":    skipped,
+            "parameters":       params,
+        }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+@api_view(["GET"])
+def get_joint_batch_preview(request):
+    """
+    Dry-run of joint multi-product optimization.
+    Shows what batch sizes WOULD be chosen to balance machine loads,
+    without writing anything to the database.
+    """
+    try:
+        from .utils import _joint_preview_no_save, _build_joint_summary
+        from .models import Product
+
+        params = {
+            "max_num_batches": int(request.GET.get("max_num_batches", 25)),
+            "min_batch_size":  int(request.GET.get("min_batch_size",  50)),
+            "max_batch_size":  int(request.GET.get("max_batch_size",  500)),
+        }
+        async_mode = request.GET.get("async_mode", "false").lower() == "true"
+
+        if async_mode:
+            from .tasks import joint_optimize_task
+            task = joint_optimize_task.delay(params, save_to_db=False)
+            return Response({
+                "task_id":          task.id,
+                "status":           "processing",
+                "message":          "Joint optimization preview started in background",
+                "check_status_url": f"/api/task-status/{task.id}/",
+            }, status=status.HTTP_202_ACCEPTED)
+
+        # ── Simple queryset — NO prefetch_related needed ──────────────────────
+        # optimize_product_batches_jointly / _joint_preview_no_save both query
+        # ProcessStep internally via ProcessStep.objects.filter(product=product)
+        products = Product.objects.filter(demand_2024__gt=0)
+
+        result = _joint_preview_no_save(
+            products,
+            params["max_num_batches"],
+            params["min_batch_size"],
+            params["max_batch_size"],
+        )
+
+        return Response({
+            "status":         result["status"],
+            "batch_analysis": result["results"],
+            "machine_loads":  result["machine_loads"],
+            "makespan_proxy": result["makespan_proxy"],
+            "summary":        _build_joint_summary(result),
+            "parameters":     params,
+        }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        traceback.print_exc()
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# =============================================================================
+# NEW  — POST /api/batch-optimization-joint/
+# =============================================================================
+
+
+@api_view(["POST"])
+def save_joint_batch_optimization(request):
+    """
+    Joint multi-product batch optimization — saves results to DB.
+
+    Optimises all products simultaneously, minimising the makespan proxy
+    (max machine load hours) rather than each product independently.
+    """
+    try:
+        from .utils import optimize_product_batches_jointly, _build_joint_summary
+        from .models import Product
+
+        params = {
+            "max_num_batches": int(request.data.get("max_num_batches", 25)),
+            "min_batch_size":  int(request.data.get("min_batch_size",  50)),
+            "max_batch_size":  int(request.data.get("max_batch_size",  500)),
+        }
+        async_mode = request.data.get("async_mode", "false").lower() == "true"
+
+        if async_mode:
+            from .tasks import joint_optimize_task
+            task = joint_optimize_task.delay(params, save_to_db=True)
+            return Response({
+                "task_id":          task.id,
+                "status":           "processing",
+                "message":          "Joint batch optimization started in background",
+                "check_status_url": f"/api/task-status/{task.id}/",
+            }, status=status.HTTP_202_ACCEPTED)
+
+        # ── Simple queryset — NO prefetch_related needed ──────────────────────
+        products = Product.objects.filter(demand_2024__gt=0)
+
+        result = optimize_product_batches_jointly(
+            products,
+            params["max_num_batches"],
+            params["min_batch_size"],
+            params["max_batch_size"],
+        )
+
+        return Response({
+            "status":           result["status"],
+            "message":          result["message"],
+            "batch_analysis":   result["results"],
+            "machine_loads":    result["machine_loads"],
+            "makespan_proxy":   result["makespan_proxy"],
+            "products_updated": result["products_updated"],
+            "summary":          _build_joint_summary(result),
+            "parameters":       params,
+        }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        traceback.print_exc()
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+

@@ -2,6 +2,7 @@
 
 import pandas as pd
 import numpy as np
+import math
 from datetime import datetime, timedelta
 from collections import defaultdict
 from django.db.models import Sum
@@ -206,142 +207,360 @@ def count_schedule_gaps(schedule: list, min_gap_sec: int = 60) -> dict:
 # 1.  BATCH-SIZE OPTIMISATION  (single-product ILP)
 # ===========================================================================
 
-def calculate_optimal_batch_size(demand, max_num_batches=25, min_batch_size=50, max_batch_size=500):
+def calculate_optimal_batch_size(
+        demand: int,
+        max_num_batches: int = 25,
+        min_batch_size: int = 50,
+        max_batch_size: int = 500,
+) -> tuple[int, int, float]:
     """
     Solve a single-product batch-size ILP with PuLP.
+
+    Returns
+    -------
+    (batch_size, num_batches, ideal_batch_size)
+
+    Fix vs. original
+    ----------------
+    The original code used the raw user min/max as ILP bounds.
+    For small demands (e.g., 121) this forced batch_size=500 with N=1,
+    which is wrong (one batch of 500 when demand is only 121 wastes
+    everything downstream).
+    For large demands (e.g., 319,908) the ILP had NO feasible solution
+    because ceil(D/n) > 500 for every n, so it always fell back to the
+    naive heuristic.
+
+    The fix: adaptively clamp the bounds to the demand-derived feasible
+    range, keeping user preferences when they are achievable.
     """
     if demand <= 0:
         return 0, 0, 0.0
 
     ideal_batch_size = demand / max_num_batches
 
-    prob = LpProblem("BatchSizeOptimization", LpMinimize)
-
-    B = LpVariable("batch_size", lowBound=min_batch_size, upBound=max_batch_size, cat=LpInteger)
-    N = LpVariable("num_batches", lowBound=1,            upBound=max_num_batches, cat=LpInteger)
-
-    prob += N
+    # ── Adaptive bounds (THE FIX) ────────────────────────────────────────────
+    eff_min, eff_max = _adaptive_bounds(
+        demand, max_num_batches, min_batch_size, max_batch_size
+    )
 
     candidates = list(range(1, max_num_batches + 1))
+
+    prob = LpProblem("BatchSizeOptimization", LpMinimize)
+
+    B = LpVariable("batch_size",  lowBound=eff_min, upBound=eff_max,  cat=LpInteger)
+    N = LpVariable("num_batches", lowBound=1,        upBound=max_num_batches, cat=LpInteger)
+
+    # Minimise number of batches (fewer set-ups)
+    prob += N
+
+    # Binary selector: exactly one candidate n is chosen
     y = {n: LpVariable(f"y_{n}", cat="Binary") for n in candidates}
 
     prob += lpSum(y[n] for n in candidates) == 1
     prob += N == lpSum(n * y[n] for n in candidates)
 
-    M = max_batch_size
+    M = eff_max  # big-M for linking constraint
     for n in candidates:
-        required_B = int(np.ceil(demand / n))
+        required_B = math.ceil(demand / n)
         prob += B >= required_B - M * (1 - y[n])
 
+    # Prune candidates whose required batch exceeds effective max
     for n in candidates:
-        if int(np.ceil(demand / n)) > max_batch_size:
+        if math.ceil(demand / n) > eff_max:
             prob += y[n] == 0
 
     prob.solve(_SOLVER)
 
     if LpStatus[prob.status] == "Optimal":
-        return int(value(B)), int(value(N)), round(ideal_batch_size, 2)
+        opt_B = max(eff_min, min(eff_max, int(round(value(B)))))
+        opt_N = max(1, min(max_num_batches, int(round(value(N)))))
+        return opt_B, opt_N, round(ideal_batch_size, 2)
 
-    fallback_N = max(1, min(max_num_batches, int(np.ceil(demand / min_batch_size))))
-    fallback_B = int(np.ceil(demand / fallback_N))
+    # ── Fallback: demand-aware heuristic ─────────────────────────────────────
+    fallback_N = max(1, min(max_num_batches, math.ceil(demand / eff_min)))
+    fallback_B = math.ceil(demand / fallback_N)
+    fallback_B = max(eff_min, min(eff_max, fallback_B))
     return fallback_B, fallback_N, round(ideal_batch_size, 2)
-
 
 # ===========================================================================
 # 2.  JOINT MULTI-PRODUCT BATCH OPTIMISATION
 # ===========================================================================
 
-def optimize_product_batches_jointly(products, max_num_batches, min_batch_size, max_batch_size):
-    """Multi-product joint batch optimisation via PuLP."""
-    step_map = {}
-    all_machines = set()
-    for product in products:
-        steps = ProcessStep.objects.filter(product=product, cycle_time_seconds__gt=0)
-        step_map[product.pk] = {}
-        for s in steps:
-            step_map[product.pk][s.machine.name] = s.cycle_time_seconds
-            all_machines.add(s.machine.name)
+def optimize_product_batches_jointly(
+        products,                    # QuerySet / list of Product ORM objects
+        max_num_batches: int = 25,
+        min_batch_size: int = 50,
+        max_batch_size: int = 500,
+        time_limit_seconds: int = 120,
+) -> dict:
+    """
+    Joint multi-product batch optimization that balances machine loads.
 
-    product_list = list(products)
+    Instead of optimising each product independently (which can create
+    bottleneck machines), this single MILP decides batch sizes for ALL
+    products simultaneously, minimising the *makespan proxy* C — the
+    maximum total processing hours on any single machine.
 
+    Decision variables
+    ------------------
+    y_{p,n}   : Binary — product p uses n batches  (one per product)
+    C         : Continuous — worst-case machine load (hours)
+
+    Objective
+    ---------
+    Minimise C  (balance machine loads)
+
+    Constraints
+    -----------
+    Per product p:
+      Σ_n y_{p,n} = 1                          (exactly one n chosen)
+      min_batch ≤ ceil(demand_p / n) ≤ max_batch  (feasibility filter)
+
+    Per machine m:
+      Σ_{p,n}  load_{p,m,n} * y_{p,n}  ≤  C   (load ≤ makespan proxy)
+
+    where  load_{p,m,n} = cycle_time_{p,m} × ceil(demand_p/n) × n / 3600
+                        = cycle_time × total_units / 3600  (hours)
+
+    Returns
+    -------
+    dict with keys:
+      status          : 'optimal' | 'fallback' | 'error'
+      results         : list of {product_id, batch_size, num_batches,
+                                 demand, ideal_batch_size, improvement}
+      makespan_proxy  : C value (hours)
+      machine_loads   : {machine_name: hours} after optimization
+      products_updated: count of products whose DB records were saved
+      message         : human-readable summary
+    """
+    from .models import ProcessStep  # avoid circular import at module level
+
+    products_list = list(products)
+
+    if not products_list:
+        return {
+            "status": "error",
+            "message": "No products provided.",
+            "results": [],
+            "makespan_proxy": 0,
+            "machine_loads": {},
+            "products_updated": 0,
+        }
+
+    # ── Collect process routing data ──────────────────────────────────────────
+    # cycle_times[product_pk][machine_name] = cycle_time_seconds (float)
+    cycle_times: dict[int, dict[str, float]] = {}
+    all_machine_names: set[str] = set()
+
+    for product in products_list:
+        steps = ProcessStep.objects.filter(product=product).select_related("machine")
+        cycle_times[product.pk] = {}
+        for step in steps:
+            mname = step.machine.name
+            # If a product visits the same machine multiple times, sum the times
+            cycle_times[product.pk][mname] = (
+                cycle_times[product.pk].get(mname, 0.0) + step.cycle_time_seconds
+            )
+            all_machine_names.add(mname)
+
+    all_machines = sorted(all_machine_names)
+
+    # ── Build the ILP ─────────────────────────────────────────────────────────
     prob = LpProblem("JointBatchOptimization", LpMinimize)
 
-    total_max_hours = sum(
-        max_batch_size * max_num_batches * sum(step_map.get(p.pk, {}).values()) / 3600
-        for p in product_list
-    )
-    C = LpVariable("makespan_proxy", lowBound=0, upBound=total_max_hours, cat=LpContinuous)
-
-    prob += C
+    # Makespan proxy: the worst machine load (hours)
+    C = LpVariable("makespan_proxy", lowBound=0, cat=LpContinuous)
+    prob += C  # objective: minimise C
 
     candidates = list(range(1, max_num_batches + 1))
 
-    B = {}
-    N = {}
-    Y = {}
+    # Per-product binary selectors
+    # Y[pk][n] = 1  iff product pk uses n batches
+    Y: dict[int, dict[int, LpVariable]] = {}
 
-    for p in product_list:
-        pk  = p.pk
-        dem = p.demand_2024
-        tag = f"p{pk}"
+    # Pre-compute effective bounds and feasible load per (product, n, machine)
+    # load_table[pk][n][machine] = hours on that machine if n batches chosen
+    load_table: dict[int, dict[int, dict[str, float]]] = {}
 
-        B[pk] = LpVariable(f"B_{tag}", lowBound=min_batch_size, upBound=max_batch_size, cat=LpInteger)
-        N[pk] = LpVariable(f"N_{tag}", lowBound=1,              upBound=max_num_batches, cat=LpInteger)
+    for product in products_list:
+        pk     = product.pk
+        demand = int(product.demand_2024) if product.demand_2024 else 0
+
+        if demand <= 0:
+            # Skip zero-demand products in the joint model
+            continue
+
+        eff_min, eff_max = _adaptive_bounds(
+            demand, max_num_batches, min_batch_size, max_batch_size
+        )
 
         Y[pk] = {}
-        for n in candidates:
-            Y[pk][n] = LpVariable(f"y_{tag}_{n}", cat="Binary")
+        load_table[pk] = {}
 
+        feasible_ns = []
+        for n in candidates:
+            batch_sz = math.ceil(demand / n)
+            if eff_min <= batch_sz <= eff_max:
+                feasible_ns.append(n)
+
+        if not feasible_ns:
+            # If no n is feasible with user bounds, open the range fully
+            eff_min, eff_max = math.ceil(demand / max_num_batches), demand
+            feasible_ns = candidates[:]
+
+        for n in candidates:
+            Y[pk][n] = LpVariable(f"y_{pk}_{n}", cat="Binary")
+
+            # Compute load on each machine for this (product, n) choice
+            batch_sz    = math.ceil(demand / n)
+            total_units = batch_sz * n  # total units produced (≥ demand)
+            load_table[pk][n] = {}
+
+            for mname in all_machines:
+                ct = cycle_times[pk].get(mname, 0.0)  # seconds per unit
+                hours = (ct * total_units) / 3600.0
+                load_table[pk][n][mname] = hours
+
+        # Constraint: exactly one n chosen
         prob += lpSum(Y[pk][n] for n in candidates) == 1
-        prob += N[pk] == lpSum(n * Y[pk][n] for n in candidates)
 
-        M = max_batch_size
+        # Constraint: prune infeasible n values
         for n in candidates:
-            req = int(np.ceil(dem / n))
-            prob += B[pk] >= req - M * (1 - Y[pk][n])
-            if req > max_batch_size:
+            batch_sz = math.ceil(demand / n)
+            if not (eff_min <= batch_sz <= eff_max):
                 prob += Y[pk][n] == 0
 
-    for m in all_machines:
-        machine_load = []
-        for p in product_list:
-            pk       = p.pk
-            dem      = p.demand_2024
-            cyc_time = step_map.get(pk, {}).get(m, 0)
-            if cyc_time == 0:
+    # ── Machine load constraints ──────────────────────────────────────────────
+    for mname in all_machines:
+        machine_load_expr = []
+        for product in products_list:
+            pk     = product.pk
+            demand = int(product.demand_2024) if product.demand_2024 else 0
+            if demand <= 0 or pk not in Y:
                 continue
             for n in candidates:
-                total_units = int(np.ceil(dem / n)) * n
-                hours       = cyc_time * total_units / 3600
-                machine_load.append(hours * Y[pk][n])
+                hours = load_table[pk][n].get(mname, 0.0)
+                if hours > 0:
+                    machine_load_expr.append(hours * Y[pk][n])
 
-        if machine_load:
-            prob += lpSum(machine_load) <= C
+        if machine_load_expr:
+            prob += lpSum(machine_load_expr) <= C
 
-    prob.solve(_SOLVER)
+    # ── Solve ─────────────────────────────────────────────────────────────────
+    solver = PULP_CBC_CMD(msg=0, timeLimit=time_limit_seconds)
+    prob.solve(solver)
 
-    log = []
-    if LpStatus[prob.status] == "Optimal":
-        for p in product_list:
-            pk          = p.pk
-            batch_size  = int(value(B[pk]))
-            num_batches = int(value(N[pk]))
+    status = LpStatus[prob.status]
+    solved_optimally = status == "Optimal"
 
-            p.batch_size  = batch_size
-            p.num_batches = num_batches
-            p.save()
+    # ── Extract results ───────────────────────────────────────────────────────
+    results       = []
+    machine_loads = {m: 0.0 for m in all_machines}
+    products_updated = 0
 
-            log.append({
-                'item':             p.item,
-                'demand':           p.demand_2024,
-                'batch_size':       batch_size,
-                'num_batches':      num_batches,
-                'ideal_batch_size': round(p.demand_2024 / max_num_batches, 2)
+    for product in products_list:
+        pk     = product.pk
+        demand = int(product.demand_2024) if product.demand_2024 else 0
+
+        # Old baseline (as in DB initialization)
+        old_batch_size  = math.ceil(demand / 12) if demand > 0 else 1
+        old_num_batches = 12
+
+        ideal_batch = round(demand / max_num_batches, 2) if demand > 0 else 0
+
+        if demand <= 0 or pk not in Y:
+            results.append({
+                "product_id":      pk,
+                "item":            product.item,
+                "description":     (product.description or "")[:50],
+                "demand":          demand,
+                "old_batch_size":  old_batch_size,
+                "old_num_batches": old_num_batches,
+                "new_batch_size":  old_batch_size,
+                "new_num_batches": old_num_batches,
+                "ideal_batch_size": ideal_batch,
+                "improvement":     "0%",
+                "source":          "skipped",
             })
-    else:
-        log = optimize_product_batches(products, max_num_batches, min_batch_size, max_batch_size)
+            continue
 
-    return log
+        if solved_optimally:
+            # Find which n was selected
+            chosen_n = None
+            for n in candidates:
+                if Y[pk][n].varValue is not None and Y[pk][n].varValue > 0.5:
+                    chosen_n = n
+                    break
+
+            if chosen_n is not None:
+                new_batch = math.ceil(demand / chosen_n)
+                new_n     = chosen_n
+            else:
+                # Safety fallback
+                eff_min, eff_max = _adaptive_bounds(
+                    demand, max_num_batches, min_batch_size, max_batch_size
+                )
+                new_n     = max(1, min(max_num_batches, math.ceil(demand / eff_min)))
+                new_batch = math.ceil(demand / new_n)
+        else:
+            # Full fallback when solver didn't find optimum
+            eff_min, eff_max = _adaptive_bounds(
+                demand, max_num_batches, min_batch_size, max_batch_size
+            )
+            new_n     = max(1, min(max_num_batches, math.ceil(demand / eff_min)))
+            new_batch = math.ceil(demand / new_n)
+            new_batch = max(eff_min, min(eff_max, new_batch))
+
+        # Accumulate actual machine loads after decision
+        for mname in all_machines:
+            if chosen_n if solved_optimally else True:
+                n_used = chosen_n if solved_optimally and chosen_n else new_n
+                ct     = cycle_times[pk].get(mname, 0.0)
+                total  = new_batch * new_n
+                machine_loads[mname] += (ct * total) / 3600.0
+
+        # Improvement metric
+        if old_num_batches != new_n:
+            improvement_pct = (old_num_batches - new_n) / old_num_batches * 100
+            improvement     = f"{improvement_pct:.1f}%"
+        else:
+            improvement = "0%"
+
+        results.append({
+            "product_id":      pk,
+            "item":            product.item,
+            "description":     (product.description or "")[:50],
+            "demand":          demand,
+            "old_batch_size":  old_batch_size,
+            "old_num_batches": old_num_batches,
+            "new_batch_size":  new_batch,
+            "new_num_batches": new_n,
+            "ideal_batch_size": ideal_batch,
+            "improvement":     improvement,
+            "source":          "joint_ilp" if solved_optimally else "fallback",
+        })
+
+        # Save to DB
+        if product.batch_size != new_batch or product.num_batches != new_n:
+            product.batch_size  = new_batch
+            product.num_batches = new_n
+            product.save(update_fields=["batch_size", "num_batches"])
+            products_updated += 1
+
+    makespan_proxy = round(value(C), 4) if solved_optimally and value(C) is not None else 0.0
+
+    return {
+        "status":           "optimal" if solved_optimally else "fallback",
+        "message":          (
+            f"Joint optimization {'succeeded' if solved_optimally else 'used fallback'}. "
+            f"{products_updated} products updated. "
+            f"Makespan proxy: {makespan_proxy:.1f}h"
+        ),
+        "results":          results,
+        "makespan_proxy":   makespan_proxy,
+        "machine_loads":    {m: round(v, 2) for m, v in machine_loads.items()},
+        "products_updated": products_updated,
+    }
 
 
 # ===========================================================================
@@ -1035,3 +1254,232 @@ def process_routing_data(process_df):
 
     machines_list = list(set(m for m in machines if m))
     return process_routing, machines_list
+
+
+def _adaptive_bounds(demand: int,
+                     max_num_batches: int,
+                     user_min: int,
+                     user_max: int) -> tuple[int, int]:
+    """
+    Compute effective [min_batch, max_batch] for this demand level.
+
+    The user-supplied min/max are treated as *hints*.  If they are
+    infeasible for this particular demand (e.g., demand=319,908 but
+    user_max=500) we fall back to the demand-derived feasible range
+    so the ILP always has a solution.
+
+    Feasible range:
+      true_min = ceil(demand / max_num_batches)   # smallest batch when N=max
+      true_max = demand                            # one big batch (N=1)
+
+    Effective bounds = intersection(user, true).
+    If intersection is empty, use the true range (demand-derived).
+    """
+    if demand <= 0:
+        return 1, 1
+
+    true_min = max(1, math.ceil(demand / max_num_batches))
+    true_max = demand  # absolute maximum is one batch of the entire demand
+
+    # Intersection with user preferences
+    eff_min = max(user_min, true_min)
+    eff_max = min(user_max, true_max)
+
+    if eff_min > eff_max:
+        # User bounds are completely outside feasible range → use demand-derived
+        eff_min = true_min
+        eff_max = true_max
+
+    return eff_min, eff_max
+
+def _build_joint_summary(result: dict) -> dict:
+    """Build a summary dict from joint optimization result."""
+    results = result.get("results", [])
+    if not results:
+        return {}
+
+    batch_sizes   = [r["new_batch_size"]  for r in results if r["demand"] > 0]
+    num_batches   = [r["new_num_batches"] for r in results if r["demand"] > 0]
+    improvements  = []
+    for r in results:
+        try:
+            pct = float(r["improvement"].replace("%", ""))
+            improvements.append(pct)
+        except (ValueError, AttributeError):
+            improvements.append(0.0)
+
+    ml = result.get("machine_loads", {})
+    most_loaded   = max(ml, key=ml.get) if ml else "—"
+    least_loaded  = min(ml, key=ml.get) if ml else "—"
+    load_vals     = list(ml.values())
+    load_balance  = round(
+        (1 - (max(load_vals) - min(load_vals)) / (max(load_vals) + 1e-9)) * 100, 1
+    ) if load_vals else 0
+
+    return {
+        "total_products":    len(results),
+        "total_demand":      sum(r["demand"] for r in results),
+        "total_batches":     sum(num_batches),
+        "avg_batch_size":    round(np.mean(batch_sizes), 1) if batch_sizes else 0,
+        "avg_improvement":   round(np.mean(improvements), 1) if improvements else 0,
+        "most_loaded_machine":  most_loaded,
+        "least_loaded_machine": least_loaded,
+        "load_balance_score": load_balance,
+        "makespan_proxy_hours": result.get("makespan_proxy", 0),
+        "solver_status":     result.get("status", "unknown"),
+    }
+
+
+def _joint_preview_no_save(products, max_num_batches, min_batch_size, max_batch_size):
+    """
+    Run joint optimization without writing to DB.
+    We do this by temporarily overriding the save step.
+    """
+    from .utils import (
+        optimize_product_batches_jointly as _joint,
+        _adaptive_bounds,
+    )
+    import math
+    from .models import ProcessStep
+    from pulp import (
+        LpProblem, LpMinimize, LpVariable, LpContinuous,
+        lpSum, value, LpStatus, PULP_CBC_CMD,
+    )
+
+    products_list = list(products)
+    candidates    = list(range(1, max_num_batches + 1))
+
+    # Collect cycle times
+    cycle_times: dict = {}
+    all_machine_names: set = set()
+
+    for product in products_list:
+        steps = ProcessStep.objects.filter(product=product).select_related("machine")
+        cycle_times[product.pk] = {}
+        for step in steps:
+            mname = step.machine.name
+            cycle_times[product.pk][mname] = (
+                cycle_times[product.pk].get(mname, 0.0) + step.cycle_time_seconds
+            )
+            all_machine_names.add(mname)
+
+    all_machines = sorted(all_machine_names)
+
+    prob = LpProblem("JointBatchOptimizationPreview", LpMinimize)
+    C    = LpVariable("makespan_proxy", lowBound=0, cat=LpContinuous)
+    prob += C
+
+    Y: dict = {}
+    load_table: dict = {}
+
+    for product in products_list:
+        pk     = product.pk
+        demand = int(product.demand_2024) if product.demand_2024 else 0
+        if demand <= 0:
+            continue
+
+        eff_min, eff_max = _adaptive_bounds(
+            demand, max_num_batches, min_batch_size, max_batch_size
+        )
+        Y[pk] = {}
+        load_table[pk] = {}
+
+        for n in candidates:
+            Y[pk][n] = LpVariable(f"yp_{pk}_{n}", cat="Binary")
+            batch_sz    = math.ceil(demand / n)
+            total_units = batch_sz * n
+            load_table[pk][n] = {}
+            for mname in all_machines:
+                ct = cycle_times[pk].get(mname, 0.0)
+                load_table[pk][n][mname] = (ct * total_units) / 3600.0
+
+        prob += lpSum(Y[pk][n] for n in candidates) == 1
+
+        for n in candidates:
+            batch_sz = math.ceil(demand / n)
+            if not (eff_min <= batch_sz <= eff_max):
+                prob += Y[pk][n] == 0
+
+    for mname in all_machines:
+        expr = []
+        for product in products_list:
+            pk     = product.pk
+            demand = int(product.demand_2024) if product.demand_2024 else 0
+            if demand <= 0 or pk not in Y:
+                continue
+            for n in candidates:
+                h = load_table[pk][n].get(mname, 0.0)
+                if h > 0:
+                    expr.append(h * Y[pk][n])
+        if expr:
+            prob += lpSum(expr) <= C
+
+    prob.solve(PULP_CBC_CMD(msg=0, timeLimit=120))
+
+    solved = LpStatus[prob.status] == "Optimal"
+    machine_loads = {m: 0.0 for m in all_machines}
+    results = []
+
+    for product in products_list:
+        pk     = product.pk
+        demand = int(product.demand_2024) if product.demand_2024 else 0
+        old_bs = product.batch_size
+        old_nb = product.num_batches
+        ideal  = round(demand / max_num_batches, 2) if demand > 0 else 0
+
+        if demand <= 0 or pk not in Y:
+            results.append({
+                "item": product.item, "description": (product.description or "")[:50],
+                "demand": demand, "old_batch_size": old_bs, "old_num_batches": old_nb,
+                "new_batch_size": old_bs, "new_num_batches": old_nb,
+                "ideal_batch_size": ideal, "improvement": "0%", "source": "skipped",
+            })
+            continue
+
+        chosen_n = None
+        if solved:
+            for n in candidates:
+                if Y[pk][n].varValue is not None and Y[pk][n].varValue > 0.5:
+                    chosen_n = n
+                    break
+
+        if chosen_n:
+            new_batch = math.ceil(demand / chosen_n)
+            new_n     = chosen_n
+        else:
+            eff_min, eff_max = _adaptive_bounds(
+                demand, max_num_batches, min_batch_size, max_batch_size
+            )
+            new_n     = max(1, min(max_num_batches, math.ceil(demand / eff_min)))
+            new_batch = math.ceil(demand / new_n)
+
+        for mname in all_machines:
+            ct    = cycle_times[pk].get(mname, 0.0)
+            total = new_batch * new_n
+            machine_loads[mname] += (ct * total) / 3600.0
+
+        impr = (
+            f"{((old_nb - new_n) / old_nb * 100):.1f}%"
+            if old_nb and old_nb != new_n else "0%"
+        )
+
+        results.append({
+            "item": product.item, "description": (product.description or "")[:50],
+            "demand": demand, "old_batch_size": old_bs, "old_num_batches": old_nb,
+            "new_batch_size": new_batch, "new_num_batches": new_n,
+            "ideal_batch_size": ideal, "improvement": impr,
+            "source": "joint_ilp" if solved else "fallback",
+        })
+
+    proxy = round(value(C), 4) if solved and value(C) is not None else 0.0
+
+    return {
+        "status":         "optimal" if solved else "fallback",
+        "results":        results,
+        "machine_loads":  {m: round(v, 2) for m, v in machine_loads.items()},
+        "makespan_proxy": proxy,
+        "products_updated": 0,
+        "message": f"Preview only — no DB writes. Status: {'optimal' if solved else 'fallback'}",
+    }
+
+
