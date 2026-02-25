@@ -40,17 +40,35 @@ _preview_cache = {}
 
 @api_view(['POST'])
 def process_csv(request):
+    """
+    Parse and summarize uploaded production CSV data.
+
+    Step-by-step:
+    1. Validate that a CSV file was uploaded in multipart form data.
+    2. Parse request filters and the number of shifts to evaluate.
+    3. Load CSV rows into a pandas DataFrame.
+    4. Normalize numeric/text columns so downstream math/filtering is stable.
+    5. Apply user-selected filters (PPS TN, project, machine, tool, area).
+    6. Clean shift-range columns used by KPI helpers.
+    7. Compute efficiency, backlog, finished-goods output, and connector output.
+    8. Return shift-wise KPIs plus a high-level summary payload.
+    """
+    # Step 1: Validate required upload input.
     csv_file = request.FILES.get('file')
     if not csv_file:
         return Response({'error': 'No file uploaded'}, status=400)
 
+    # Step 2: Read optional runtime parameters.
     num_shifts = int(request.POST.get("num_shifts", 28))
+    # Step 3: Load CSV into memory for transformation and aggregation.
     df = pd.read_csv(csv_file)
 
+    # Step 4: Standardize columns before any filtering or calculations.
     clean_numeric_columns(df, ['Planned', 'Realized', 'Backlog', 'Open'])
     clean_text_columns(df, ['Step', 'Area', 'Sub-Project'])
     clean_text_columns(df, ['PPS TN', 'Project', 'Sub-Project', 'Machine', 'Tool No.', 'Area'])
 
+    # Step 5: Apply optional API filters from request body values.
     df = apply_filters(df, {
         'PPS TN':      request.POST.get("pps_tn",       "All"),
         'Project':     request.POST.get("project",      "All"),
@@ -60,8 +78,10 @@ def process_csv(request):
         'Area':        request.POST.get("area",         "All"),
     })
 
+    # Step 6: Clean shift columns expected by legacy index windows.
     clean_shift_columns(df, [(14, 50), (95, 113)])
 
+    # Step 7: Compute KPI series used in the response.
     efficiency = calculate_efficiency(df, num_shifts)
     backlog    = calculate_backlog(df)
 
@@ -70,6 +90,7 @@ def process_csv(request):
 
     fg_output, conn_output = calculate_production_outputs(df, finished_filter, connector_filter)
 
+    # Step 8: Build a client-friendly response shape.
     result = {
         "Total Backlog Finished Goods":      dict(zip(SHIFT_LABELS, map(str, backlog))),
         "Production Output Finished Goods":  fg_output,
@@ -85,14 +106,26 @@ def process_csv(request):
 
 @api_view(['GET'])
 def get_filter_options(request):
-    """Get available filter options (machines, products, date range, dcc_types) from DB."""
+    """
+    Return static/derived filter options used by frontend controls.
+
+    Step-by-step:
+    1. Read machines from DB.
+    2. Read products with positive demand.
+    3. Build a distinct sorted list of non-empty DCC types.
+    4. Detect available schedule date range (min start, max end).
+    5. Return all filter metadata in one payload.
+    """
     try:
+        # Step 1: Load all machine names.
         machines = list(Machine.objects.all().values_list('name', flat=True))
+        # Step 2: Load active products with core fields used by UI.
         products = list(
             Product.objects.filter(demand_2024__gt=0).values(
                 'item', 'description', 'dcc_type', 'demand_2024', 'batch_size', 'num_batches'
             )
         )
+        # Step 3: Build distinct list of available DCC types.
         dcc_types = list(
             Product.objects.filter(demand_2024__gt=0)
             .values_list('dcc_type', flat=True)
@@ -101,6 +134,7 @@ def get_filter_options(request):
         )
         dcc_types = [t for t in dcc_types if t]
 
+        # Step 4: Compute schedule date boundaries if schedules exist.
         schedules = ProductionSchedule.objects.all()
         if schedules.exists():
             min_date = schedules.aggregate(Min('start_time'))['start_time__min']
@@ -108,6 +142,7 @@ def get_filter_options(request):
         else:
             min_date = max_date = None
 
+        # Step 5: Return filter options.
         return Response({
             'machines':   machines,
             'products':   products,
@@ -125,12 +160,24 @@ def get_filter_options(request):
 
 @api_view(['GET'])
 def get_kpis(request):
-    """Get KPI metrics with bottleneck detection."""
+    """
+    Compute global schedule KPIs and machine-level utilization.
+
+    Step-by-step:
+    1. Ensure a schedule exists.
+    2. Compute makespan window in hours/days.
+    3. Compute per-machine used hours, operation count, and utilization.
+    4. Identify the most utilized machine as bottleneck.
+    5. Compute throughput metrics using total demand and makespan.
+    6. Return full KPI payload.
+    """
     try:
+        # Step 1: Load all schedule rows and short-circuit when empty.
         schedules = ProductionSchedule.objects.all()
         if not schedules.exists():
             return Response({'message': 'No schedules available'}, status=status.HTTP_200_OK)
 
+        # Step 2: Compute total makespan of the persisted schedule.
         min_start      = schedules.aggregate(Min('start_time'))['start_time__min']
         max_end        = schedules.aggregate(Max('end_time'))['end_time__max']
         makespan_hours = (max_end - min_start).total_seconds() / 3600
@@ -139,6 +186,7 @@ def get_kpis(request):
         machines      = Machine.objects.all()
         machine_stats = []
 
+        # Step 3: Build machine-level utilization metrics.
         for machine in machines:
             used_hours     = schedules.filter(machine=machine).aggregate(
                 total=Sum('duration_hours')
@@ -155,6 +203,7 @@ def get_kpis(request):
 
         machine_stats_sorted = sorted(machine_stats, key=lambda x: x['utilization'], reverse=True)
 
+        # Step 4: Top utilization machine is treated as current bottleneck.
         bottleneck = None
         if machine_stats_sorted:
             bottleneck = {
@@ -163,12 +212,14 @@ def get_kpis(request):
                 'used_hours':  machine_stats_sorted[0]['used_hours']
             }
 
+        # Step 5: Compute total throughput from demand and makespan.
         total_units         = Product.objects.filter(demand_2024__gt=0).aggregate(
             total=Sum('demand_2024')
         )['total'] or 0
         throughput_per_day  = (total_units / makespan_days)  if makespan_days  > 0 else 0
         throughput_per_hour = (total_units / makespan_hours) if makespan_hours > 0 else 0
 
+        # Step 6: Return KPI response.
         return Response({
             'total_makespan_hours':     round(makespan_hours,      2),
             'total_makespan_days':      round(makespan_days,       2),
@@ -190,11 +241,22 @@ def get_kpis(request):
 
 @api_view(['GET'])
 def get_task_status(request, task_id):
-    """Check the status of an async Celery task."""
+    """
+    Return current status/progress for a Celery background task.
+
+    Step-by-step:
+    1. Resolve the task by id.
+    2. Build a common response envelope.
+    3. Map Celery states to user-facing progress/status fields.
+    4. Return standardized task response.
+    """
     try:
+        # Step 1: Lookup task state and metadata from Celery backend.
         task_result = AsyncResult(task_id)
+        # Step 2: Start response with generic identifiers.
         response    = {'task_id': task_id, 'state': task_result.state}
 
+        # Step 3: Translate state into API-friendly status object.
         if task_result.state == 'PENDING':
             response.update({'progress': 0,   'status': 'Task is waiting to start...'})
         elif task_result.state == 'PROGRESS':
@@ -209,6 +271,7 @@ def get_task_status(request, task_id):
         else:
             response.update({'progress': 0,   'status': task_result.state})
 
+        # Step 4: Return normalized payload.
         return Response(response, status=status.HTTP_200_OK)
 
     except Exception as e:
@@ -221,8 +284,21 @@ def get_task_status(request, task_id):
 
 @api_view(['POST'])
 def initialize_data(request):
-    """Initialize database with uploaded CSV files (supports async mode)."""
+    """
+    Initialize master data tables from uploaded Frontpage and Process CSVs.
+
+    Step-by-step:
+    1. Validate required files are present in the request.
+    2. Choose async or sync execution path.
+    3. Async path saves files temporarily and enqueues Celery initialization.
+    4. Sync path parses CSVs and converts them into normalized structures.
+    5. Clear existing model data to rebuild a clean dataset.
+    6. Create machine records.
+    7. Create product records and link process steps per product.
+    8. Return created-record counters.
+    """
     try:
+        # Step 1: Validate required file uploads.
         if 'frontpage' not in request.FILES or 'process' not in request.FILES:
             return Response(
                 {'error': 'Both Frontpage.csv and Process.csv files are required'},
@@ -233,6 +309,7 @@ def initialize_data(request):
         process_file   = request.FILES['process']
         async_mode     = request.POST.get('async_mode', 'true').lower() == 'true'
 
+        # Step 2-3: Async path for long-running initialization workloads.
         if async_mode:
             temp_dir       = tempfile.mkdtemp()
             frontpage_path = os.path.join(temp_dir, 'frontpage.csv')
@@ -255,6 +332,7 @@ def initialize_data(request):
             }, status=status.HTTP_202_ACCEPTED)
 
         # ── Sync fallback ─────────────────────────────────────────────
+        # Step 4: Sync fallback parses CSV files directly in request lifecycle.
         try:
             frontpage_df = pd.read_csv(frontpage_file)
             process_df   = pd.read_csv(process_file)
@@ -262,14 +340,17 @@ def initialize_data(request):
         except Exception as e:
             return Response({'error': f'Error reading CSV files: {str(e)}'}, status=400)
 
+        # Step 4 (continued): Normalize source CSVs into domain-specific structures.
         demand_data                    = process_frontpage_data(frontpage_df)
         process_routing, machines_list = process_routing_data(process_df)
 
+        # Step 5: Reset existing rows before rebuilding from source files.
         Product.objects.all().delete()
         Machine.objects.all().delete()
         ProcessStep.objects.all().delete()
         ProductionSchedule.objects.all().delete()
 
+        # Step 6: Create and cache machine objects by machine name.
         machines = {}
         for machine_name in machines_list:
             if machine_name:
@@ -277,6 +358,7 @@ def initialize_data(request):
                     name=machine_name, available_hours_per_day=24
                 )
 
+        # Step 7: Create products and attach all matching process steps.
         for i in range(len(demand_data['Item'])):
             item   = demand_data['Item'][i]
             demand = demand_data['Demand_2024'][i]
@@ -310,6 +392,7 @@ def initialize_data(request):
                             workers_required   = step_data['workers']
                         )
 
+        # Step 8: Return import summary counters.
         return Response({
             'message':               'Database initialized successfully',
             'products_created':      Product.objects.count(),
@@ -328,15 +411,28 @@ def initialize_data(request):
 
 @api_view(['GET'])
 def get_buffer_optimization(request):
-    """Allocate buffers across machines using a PuLP LP."""
+    """
+    Recommend buffer sizes per machine using schedule statistics.
+
+    Step-by-step:
+    1. Validate schedule availability.
+    2. Read optimization parameters (safety factor and optional budget).
+    3. Compute makespan and throughput baseline.
+    4. Compute required buffer per machine from average operation duration.
+    5. Optionally optimize allocation under budget constraints.
+    6. Return ranked recommendations and parameter context.
+    """
     try:
+        # Step 1: Ensure schedule data exists.
         schedules = ProductionSchedule.objects.all()
         if not schedules.exists():
             return Response({'message': 'No schedules available'}, status=status.HTTP_200_OK)
 
+        # Step 2: Parse request parameters used by buffer sizing logic.
         safety_factor = float(request.GET.get('safety_factor', 1.5))
         total_budget  = request.GET.get('total_budget')
 
+        # Step 3: Compute makespan and throughput baseline.
         min_start      = schedules.aggregate(Min('start_time'))['start_time__min']
         max_end        = schedules.aggregate(Max('end_time'))['end_time__max']
         makespan_hours = (max_end - min_start).total_seconds() / 3600
@@ -349,6 +445,7 @@ def get_buffer_optimization(request):
         machines    = Machine.objects.all()
         buffer_data = []
 
+        # Step 4: Build one recommendation row per active machine.
         for machine in machines:
             machine_schedules = schedules.filter(machine=machine)
             if not machine_schedules.exists():
@@ -375,10 +472,12 @@ def get_buffer_optimization(request):
                 ),
             })
 
+        # Step 5: Apply LP-based constrained allocation when budget is provided.
         if total_budget is not None:
             total_budget = float(total_budget)
             buffer_data  = pulp_optimize_buffers(buffer_data, total_budget)
 
+        # Step 6: Sort worst-to-best by required buffer for UI consumption.
         buffer_data.sort(key=lambda x: x['required_buffer'], reverse=True)
 
         response_payload = {
@@ -411,12 +510,23 @@ def get_buffer_optimization(request):
 
 @api_view(['GET'])
 def get_bottleneck_analysis(request):
-    """Detailed bottleneck analysis with recommendations."""
+    """
+    Provide machine-level bottleneck diagnostics with recommendations.
+
+    Step-by-step:
+    1. Validate schedule availability.
+    2. Compute global makespan.
+    3. Compute utilization/idle metrics per machine.
+    4. Classify each machine by utilization band.
+    5. Rank machines and return summary plus detail rows.
+    """
     try:
+        # Step 1: Ensure schedule data exists before computing KPIs.
         schedules = ProductionSchedule.objects.all()
         if not schedules.exists():
             return Response({'message': 'No schedules available'}, status=status.HTTP_200_OK)
 
+        # Step 2: Compute the total schedule window.
         min_start      = schedules.aggregate(Min('start_time'))['start_time__min']
         max_end        = schedules.aggregate(Max('end_time'))['end_time__max']
         makespan_hours = (max_end - min_start).total_seconds() / 3600
@@ -424,6 +534,7 @@ def get_bottleneck_analysis(request):
         machines             = Machine.objects.all()
         bottleneck_analysis  = []
 
+        # Step 3-4: Build per-machine diagnostic metrics and classification.
         for machine in machines:
             machine_schedules = schedules.filter(machine=machine)
             if not machine_schedules.exists():
@@ -466,6 +577,7 @@ def get_bottleneck_analysis(request):
                 'recommendation':           recommendation,
             })
 
+        # Step 5: Rank by utilization and compute summary headline metrics.
         bottleneck_analysis.sort(key=lambda x: x['utilization'], reverse=True)
 
         summary = {
@@ -488,8 +600,17 @@ def get_bottleneck_analysis(request):
 # ===========================================================================
 
 def _build_params(request_obj, is_post=False):
-    """Extract and validate optimization parameters from GET or POST."""
+    """
+    Extract optimization parameters from request and cast to integers.
+
+    Step-by-step:
+    1. Select source collection based on request type.
+    2. Read values with safe defaults.
+    3. Convert to integers for deterministic calculations.
+    """
+    # Step 1: Choose request payload source (`data` vs query params).
     getter = request_obj.data if is_post else request_obj.GET
+    # Step 2-3: Read values and cast for downstream math.
     return {
         "max_num_batches": int(getter.get("max_num_batches", 25)),
         "min_batch_size":  int(getter.get("min_batch_size",  50)),
@@ -500,14 +621,22 @@ def _build_params(request_obj, is_post=False):
 @api_view(["GET"])
 def get_batch_optimization_preview(request):
     """
-    Preview batch-size optimization for every product (supports async).
+    Preview optimized batch parameters for all products without DB writes.
 
-    Fix: adaptive bounds applied per product so the ILP is always feasible.
+    Step-by-step:
+    1. Parse optimization parameters and execution mode.
+    2. If async is enabled, enqueue background preview task.
+    3. In sync mode, iterate all products with positive demand.
+    4. Compute optimized batch size/num batches per product.
+    5. Compare against current settings and build analysis rows.
+    6. Compute aggregate summary metrics and return response.
     """
     try:
+        # Step 1: Parse validated params and mode toggle.
         params     = _build_params(request)
         async_mode = request.GET.get("async_mode", "false").lower() == "true"
 
+        # Step 2: Async path returns task metadata immediately.
         if async_mode:
             task = batch_optimize_preview_task.delay(params)
             return Response({
@@ -518,12 +647,14 @@ def get_batch_optimization_preview(request):
             }, status=status.HTTP_202_ACCEPTED)
 
         # ── Sync ──────────────────────────────────────────────────────────────
+        # Step 3: Sync path computes previews inline for each product.
         products       = Product.objects.filter(demand_2024__gt=0)
         batch_analysis = []
         total_demand   = 0
         total_batches  = 0
         batch_sizes    = []
 
+        # Step 4-5: Evaluate optimized values and prepare per-product output.
         for product in products:
             demand = int(product.demand_2024)
 
@@ -565,6 +696,7 @@ def get_batch_optimization_preview(request):
             total_batches += num_batches
             batch_sizes.append(batch_size)
 
+        # Step 6: Return full analysis and aggregate summary statistics.
         return Response({
             "batch_analysis": batch_analysis,
             "summary": {
@@ -594,7 +726,7 @@ def get_batch_optimization_preview(request):
 @api_view(['POST'])
 def generate_schedule(request):
     """
-    Kick off async job-shop schedule generation.
+    Generate production schedule either asynchronously or synchronously.
 
     Request body
     ------------
@@ -605,8 +737,15 @@ def generate_schedule(request):
     product_pks        : [int]          (default: all)
     batch_overrides    : [[pk,bs,nb],…] (optional)
     async_mode         : bool           (default true)
+    Step-by-step:
+    1. Validate prerequisite master data (products + process steps).
+    2. Parse scheduler parameters from request body.
+    3. If async mode, dispatch background task and return task metadata.
+    4. If sync mode, compute start datetime and run scheduler inline.
+    5. Compute schedule KPIs and return operation count + KPIs.
     """
     try:
+        # Step 1: Validate required master data exists before scheduling.
         if not Product.objects.filter(demand_2024__gt=0).exists():
             return Response(
                 {'error': 'No products found. Please run Initialize Data first.'},
@@ -618,6 +757,7 @@ def generate_schedule(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Step 2: Build scheduler parameter dict from request data.
         params = {
             'start_date':          request.data.get('start_date'),
             'local_opt_machines':  int(request.data.get('local_opt_machines', 5)),
@@ -629,6 +769,7 @@ def generate_schedule(request):
 
         async_mode = str(request.data.get('async_mode', 'true')).lower() == 'true'
 
+        # Step 3: Async path delegates heavy scheduling to Celery.
         if async_mode:
             task = generate_schedule_task.delay(params)
             return Response({
@@ -638,7 +779,7 @@ def generate_schedule(request):
                 'check_status_url': f'/api/task-status/{task.id}/',
             }, status=status.HTTP_202_ACCEPTED)
 
-        # Sync fallback
+        # Step 4: Sync fallback runs scheduler in-request.
         from .utils import run_job_shop_scheduler, compute_schedule_kpis
         from datetime import datetime
 
@@ -653,6 +794,7 @@ def generate_schedule(request):
             local_opt_machines = params['local_opt_machines'],
             enable_compaction  = params['enable_compaction'],   # ← NEW
         )
+        # Step 5: Compute KPI summary from generated operation rows.
         makespan = max(r['end_hrs'] for r in rows) if rows else 0
         kpis     = compute_schedule_kpis(rows, makespan)
 
@@ -672,16 +814,24 @@ def generate_schedule(request):
 
 @api_view(['GET'])
 def get_schedule(request):
-    """Retrieve persisted schedule records with optional filters.
-    Query params: machine, product, machines (comma-separated), products (comma-separated item ids),
-    start, end (ISO date or datetime), batch_size_min, batch_size_max, duration_min, duration_max, step.
+    """
+    Retrieve persisted schedule rows with filtering and pagination.
+
+    Step-by-step:
+    1. Start from base queryset with related objects for response shaping.
+    2. Apply backward-compatible single-value filters.
+    3. Apply multi-value filters (machines/products lists).
+    4. Apply date, batch-size, duration, step, and DCC filters.
+    5. Apply pagination and output format conversion.
+    6. Return paginated metadata and row payload.
     """
     try:
+        # Step 1: Build base queryset with related objects and deterministic order.
         schedules = ProductionSchedule.objects.select_related(
             'machine', 'product', 'process_step'
         ).order_by('start_time', 'machine')
 
-        # Single machine/product (backward compatible)
+        # Step 2: Backward-compatible single machine/product filters.
         machine_filter = request.GET.get('machine')
         product_filter = request.GET.get('product')
         if machine_filter:
@@ -692,7 +842,7 @@ def get_schedule(request):
             except (ValueError, TypeError):
                 pass
 
-        # Multi machine/product
+        # Step 3: Comma-separated multi machine/product filters.
         machines_param = request.GET.get('machines')
         if machines_param:
             names = [m.strip() for m in machines_param.split(',') if m.strip()]
@@ -707,7 +857,7 @@ def get_schedule(request):
             except (ValueError, TypeError):
                 pass
 
-        # Date range (start_time/end_time)
+        # Step 4: Date range filters.
         start_param = request.GET.get('start')
         end_param = request.GET.get('end')
         if start_param:
@@ -715,7 +865,7 @@ def get_schedule(request):
         if end_param:
             schedules = schedules.filter(end_time__lte=end_param)
 
-        # Batch size range
+        # Step 4 (continued): Batch size range filters.
         batch_min = request.GET.get('batch_size_min')
         batch_max = request.GET.get('batch_size_max')
         if batch_min is not None and batch_min != '':
@@ -729,7 +879,7 @@ def get_schedule(request):
             except (ValueError, TypeError):
                 pass
 
-        # Duration range (hours)
+        # Step 4 (continued): Duration range filters.
         dur_min = request.GET.get('duration_min')
         dur_max = request.GET.get('duration_max')
         if dur_min is not None and dur_min != '':
@@ -743,7 +893,7 @@ def get_schedule(request):
             except (ValueError, TypeError):
                 pass
 
-        # Process step number
+        # Step 4 (continued): Specific process-step filter.
         step_param = request.GET.get('step')
         if step_param is not None and step_param != '':
             try:
@@ -752,17 +902,19 @@ def get_schedule(request):
             except (ValueError, TypeError):
                 pass
 
-        # DCC type (product level)
+        # Step 4 (continued): Product-level DCC type filter.
         dcc_param = request.GET.get('dcc_type')
         if dcc_param and dcc_param.strip():
             schedules = schedules.filter(product__dcc_type=dcc_param.strip())
 
+        # Step 5: Pagination controls with safe bounds.
         total_count = schedules.count()
         page_size   = min(int(request.GET.get('page_size', 200)), 1000)
         page        = max(int(request.GET.get('page', 1)), 1)
         offset      = (page - 1) * page_size
         schedules   = schedules[offset: offset + page_size]
 
+        # Step 5 (continued): Choose response schema (`gantt` vs `full`).
         out_format = request.GET.get('format', 'full')
 
         if out_format == 'gantt':
@@ -799,6 +951,7 @@ def get_schedule(request):
                 for s in schedules
             ]
 
+        # Step 6: Return paginated payload and metadata.
         return Response({
             'count':       total_count,
             'page':        page,
@@ -817,17 +970,30 @@ def get_schedule(request):
 
 @api_view(['GET'])
 def get_schedule_gantt(request):
-    """Return Gantt-ready data aggregated by machine."""
+    """
+    Return schedule rows in a Gantt-friendly shape.
+
+    Step-by-step:
+    1. Start with schedule queryset and optional machine/date filtering.
+    2. Early-return empty payload when no schedule rows exist.
+    3. Apply bar-limit truncation for frontend performance.
+    4. Build deterministic product color keys.
+    5. Build gantt bars and machine ordering metadata.
+    6. Return bars, date range, and truncation info.
+    """
     try:
+        # Step 1: Base queryset with related models for rendering fields.
         schedules = ProductionSchedule.objects.select_related(
             'machine', 'product', 'process_step'
         )
 
+        # Step 1 (continued): Optional machine filter.
         machines_param = request.GET.get('machines')
         if machines_param:
             machine_names = [m.strip() for m in machines_param.split(',')]
             schedules = schedules.filter(machine__name__in=machine_names)
 
+        # Step 1 (continued): Optional date-window filters.
         start_param = request.GET.get('start')
         end_param   = request.GET.get('end')
         if start_param:
@@ -835,18 +1001,22 @@ def get_schedule_gantt(request):
         if end_param:
             schedules = schedules.filter(end_time__lte=end_param)
 
+        # Step 2: Return canonical empty response when no data is found.
         if not schedules.exists():
             return Response({'gantt_bars': [], 'machines': [], 'date_range': {}, 'total_bars': 0})
 
+        # Step 3: Limit output size and keep stable machine/time ordering.
         total_bars = schedules.count()
         max_bars   = int(request.GET.get('max_bars', 500))
         schedules  = schedules.order_by('machine__name', 'start_time')[:max_bars]
 
+        # Step 4: Build stable product->color-key mapping.
         product_items = list(
             ProductionSchedule.objects.values_list('product__item', flat=True).distinct()
         )
         color_map = {item: idx % 20 for idx, item in enumerate(sorted(product_items))}
 
+        # Step 5: Convert schedule rows to Gantt bar schema.
         gantt_bars = [
             {
                 'machine':    s.machine.name,
@@ -863,6 +1033,7 @@ def get_schedule_gantt(request):
             for s in schedules
         ]
 
+        # Step 5 (continued): Build machine display order by descending load.
         machine_loads = (
             ProductionSchedule.objects
             .values('machine__name')
@@ -875,6 +1046,7 @@ def get_schedule_gantt(request):
             start=Min('start_time'), end=Max('end_time')
         )
 
+        # Step 6: Return chart-ready payload with metadata.
         return Response({
             'gantt_bars': gantt_bars,
             'machines':   machine_order,
@@ -899,8 +1071,7 @@ def gap_analysis(request):
     """
     GET /api/gap-analysis/
 
-    Analyse the current saved schedule for idle gaps between consecutive
-    operations on each machine.
+    Analyse machine idle gaps between consecutive operations.
 
     Response
     --------
@@ -934,21 +1105,30 @@ def gap_analysis(request):
                     (upstream step on different machine not yet done)
     "spt"         – same product, first step
                     (SPT reordering artefact)
+    Step-by-step:
+    1. Load schedule rows ordered by machine and start time.
+    2. Group operations by machine.
+    3. Scan adjacent operations and detect meaningful idle gaps.
+    4. Classify each gap cause using lightweight heuristics.
+    5. Aggregate machine statistics and global totals.
+    6. Return gap list, machine stats, and cause counters.
     """
     try:
+        # Step 1: Fetch schedule rows in machine/time order for gap detection.
         schedules = (
             ProductionSchedule.objects
             .select_related('machine', 'product', 'process_step')
             .order_by('machine__name', 'start_time')
         )
 
+        # Step 1: Abort with explicit message when no schedule is available.
         if not schedules.exists():
             return Response(
                 {'detail': 'No schedule found. Generate a schedule first.'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        # Group by machine
+        # Step 2: Group operations by machine name.
         machine_ops: dict = defaultdict(list)
         for s in schedules:
             machine_ops[s.machine.name].append(s)
@@ -957,22 +1137,25 @@ def gap_analysis(request):
         machine_stats = []
         causes        = {'precedence': 0, 'interleave': 0, 'spt': 0}
 
+        # Step 3-4: Walk each machine timeline and classify detected gaps.
         for machine_name, mops in machine_ops.items():
             # Already ordered by start_time from the queryset
             idle_hours = 0.0
             gap_count  = 0
 
+            # Iterate adjacent operations to measure idle intervals.
             for i in range(1, len(mops)):
                 prev     = mops[i - 1]
                 curr     = mops[i]
                 gap_secs = (curr.start_time - prev.end_time).total_seconds()
 
+                # Ignore tiny timing differences and track only genuine idle gaps.
                 if gap_secs > 60:       # > 1 minute = genuine idle gap
                     idle_h     = gap_secs / 3600
                     idle_hours += idle_h
                     gap_count  += 1
 
-                    # Classify cause
+                    # Step 4: Assign a coarse cause label for root-cause analysis.
                     prev_prod = str(prev.product.item)
                     curr_prod = str(curr.product.item)
 
@@ -1003,12 +1186,14 @@ def gap_analysis(request):
             })
 
         # Sort gaps worst-first
+        # Step 5: Rank for "worst first" dashboards and aggregate headline metrics.
         gap_list.sort(key=lambda g: g['idle_hours'], reverse=True)
         machine_stats.sort(key=lambda m: m['idle_hours'], reverse=True)
 
         worst = machine_stats[0]['machine'] if machine_stats else '—'
         clean = sum(1 for m in machine_stats if m['gap_count'] == 0)
 
+        # Step 6: Return complete analysis payload.
         return Response({
             'total_gaps':       len(gap_list),
             'total_idle_hours': round(sum(g['idle_hours'] for g in gap_list), 2),
@@ -1030,24 +1215,37 @@ def gap_analysis(request):
 
 @api_view(['GET'])
 def schedule_comparison(request):
-    """Compare KPIs of the current saved schedule."""
+    """
+    Return baseline KPI snapshot for the currently saved schedule.
+
+    Step-by-step:
+    1. Validate schedule existence.
+    2. Aggregate top-level makespan/operations/units metrics.
+    3. Aggregate machine-level load and operation counts.
+    4. Compute utilization percentages and average utilization.
+    5. Return normalized comparison payload.
+    """
     try:
+        # Step 1: Load schedules and stop early when no data exists.
         schedules = ProductionSchedule.objects.select_related('machine', 'product')
         if not schedules.exists():
             return Response({'message': 'No schedule available.'}, status=200)
 
+        # Step 2: Compute global schedule aggregates.
         agg = schedules.aggregate(
             start=Min('start_time'), end=Max('end_time'),
             total_ops=Count('id'), total_units=Sum('batch_size')
         )
         makespan = (agg['end'] - agg['start']).total_seconds() / 3600 if agg['end'] else 0
 
+        # Step 3: Aggregate per-machine load and operation counts.
         machine_stats = (
             schedules.values('machine__name')
             .annotate(load=Sum('duration_hours'), ops=Count('id'))
             .order_by('-load')
         )
 
+        # Step 4: Convert machine aggregate rows to API response objects.
         stats = [
             {
                 'machine':     m['machine__name'],
@@ -1058,6 +1256,7 @@ def schedule_comparison(request):
             for m in machine_stats
         ]
 
+        # Step 5: Return current-schedule KPI payload.
         return Response({
             'current_schedule': {
                 'makespan_hours':   round(makespan, 2),
@@ -1081,18 +1280,30 @@ def schedule_comparison(request):
 
 @api_view(['GET'])
 def optimize_schedule_preview(request):
-    """Preview re-running the scheduler without saving to DB."""
+    """
+    Preview scheduler KPIs without persisting schedule rows.
+
+    Step-by-step:
+    1. Parse local optimization parameter and fetch active products.
+    2. Validate product availability.
+    3. Run scheduler in memory.
+    4. Compute and return preview KPIs.
+    """
     try:
+        # Step 1: Parse scheduler tuning parameter and load active products.
         local_opt = int(request.GET.get('local_opt_machines', 5))
         products  = list(Product.objects.filter(demand_2024__gt=0))
 
+        # Step 2: Guard against empty product data.
         if not products:
             return Response({'error': 'No products in DB.'}, status=400)
 
         from .utils import run_job_shop_scheduler, compute_schedule_kpis
         from datetime import datetime
 
+        # Step 3: Generate in-memory schedule preview rows.
         rows     = run_job_shop_scheduler(products, datetime.now(), local_opt_machines=local_opt)
+        # Step 4: Build KPI snapshot from preview rows.
         makespan = max(r['end_hrs'] for r in rows) if rows else 0
         kpis     = compute_schedule_kpis(rows, makespan)
 
@@ -1104,19 +1315,41 @@ def optimize_schedule_preview(request):
 
 @api_view(['POST'])
 def optimize_schedule_save(request):
-    """Same as generate_schedule but always re-optimises and saves."""
+    """
+    Force schedule re-optimization and persistence via `generate_schedule`.
+
+    Step-by-step:
+    1. Force schedule replacement (`clear_existing=True`).
+    2. Normalize local optimization parameter.
+    3. Delegate to `generate_schedule`.
+    """
+    # Step 1: Always clear old rows when invoking this endpoint.
     request.data['clear_existing']     = True
+    # Step 2: Ensure integer type before delegation.
     request.data['local_opt_machines'] = int(request.data.get('local_opt_machines', 5))
+    # Step 3: Reuse shared scheduling implementation.
     return generate_schedule(request)
 
 
 @api_view(["POST"])
 def save_batch_optimization(request):
-    """Apply optimized batch sizes to all products and save to DB."""
+    """
+    Apply independently optimized batch settings and persist to DB.
+
+    Step-by-step:
+    1. Parse optimization params and async toggle.
+    2. Async path enqueues save task.
+    3. Sync path loops through active products.
+    4. Compute optimal settings for each product.
+    5. Persist only changed rows; track skipped items.
+    6. Return update summary.
+    """
     try:
+        # Step 1: Parse parameter bounds and async mode.
         params     = _build_params(request, is_post=True)
         async_mode = request.data.get("async_mode", "false").lower() == "true"
 
+        # Step 2: Async save path for long-running updates.
         if async_mode:
             task = batch_optimize_save_task.delay(params)
             return Response({
@@ -1126,10 +1359,12 @@ def save_batch_optimization(request):
                 "check_status_url": f"/api/task-status/{task.id}/",
             }, status=status.HTTP_202_ACCEPTED)
 
+        # Step 3: Sync path applies updates in request lifecycle.
         products = Product.objects.filter(demand_2024__gt=0)
         updated  = []
         skipped  = []
 
+        # Step 4-5: Compute and persist only changed batch settings.
         for product in products:
             demand = int(product.demand_2024)
             batch_size, num_batches, _ = calculate_optimal_batch_size(
@@ -1157,6 +1392,7 @@ def save_batch_optimization(request):
                     "new_num_batches":  num_batches,
                 })
 
+        # Step 6: Return summary payload of updates and skips.
         return Response({
             "message":          "Batch optimization applied successfully",
             "total_updated":    len(updated),
@@ -1172,14 +1408,20 @@ def save_batch_optimization(request):
 @api_view(["GET"])
 def get_joint_batch_preview(request):
     """
-    Dry-run of joint multi-product optimization.
-    Shows what batch sizes WOULD be chosen to balance machine loads,
-    without writing anything to the database.
+    Preview joint multi-product optimization without writing to DB.
+
+    Step-by-step:
+    1. Parse optimization bounds and async mode.
+    2. Async path enqueues preview task.
+    3. Sync path loads active products.
+    4. Run joint optimization preview routine.
+    5. Return result matrix, machine loads, and summary.
     """
     try:
         from .utils import _joint_preview_no_save, _build_joint_summary
         from .models import Product
 
+        # Step 1: Parse bounds and execution mode.
         params = {
             "max_num_batches": int(request.GET.get("max_num_batches", 25)),
             "min_batch_size":  int(request.GET.get("min_batch_size",  50)),
@@ -1187,6 +1429,7 @@ def get_joint_batch_preview(request):
         }
         async_mode = request.GET.get("async_mode", "false").lower() == "true"
 
+        # Step 2: Async preview path for long-running calculations.
         if async_mode:
             from .tasks import joint_optimize_task
             task = joint_optimize_task.delay(params, save_to_db=False)
@@ -1200,8 +1443,10 @@ def get_joint_batch_preview(request):
         # ── Simple queryset — NO prefetch_related needed ──────────────────────
         # optimize_product_batches_jointly / _joint_preview_no_save both query
         # ProcessStep internally via ProcessStep.objects.filter(product=product)
+        # Step 3: Fetch products included in optimization.
         products = Product.objects.filter(demand_2024__gt=0)
 
+        # Step 4: Compute joint optimization result without DB updates.
         result = _joint_preview_no_save(
             products,
             params["max_num_batches"],
@@ -1209,6 +1454,7 @@ def get_joint_batch_preview(request):
             params["max_batch_size"],
         )
 
+        # Step 5: Return preview payload and computed summary metrics.
         return Response({
             "status":         result["status"],
             "batch_analysis": result["results"],
@@ -1231,12 +1477,19 @@ def get_joint_batch_preview(request):
 @api_view(["POST"])
 def save_joint_batch_optimization(request):
     """
+    Step-by-step:
+    1. Parse optimization bounds and async mode.
+    2. Async path enqueues save task.
+    3. Sync path loads active products.
+    4. Run joint optimization and persist product updates.
+    5. Return updated state, load metrics, and summary.
     Joint multi-product batch optimization — saves results to DB.
 
     Optimises all products simultaneously, minimising the makespan proxy
     (max machine load hours) rather than each product independently.
     """
     try:
+        # Step 1: Parse bounds and execution mode, then choose async/sync path.
         from .utils import optimize_product_batches_jointly, _build_joint_summary
         from .models import Product
 
@@ -1247,6 +1500,7 @@ def save_joint_batch_optimization(request):
         }
         async_mode = request.data.get("async_mode", "false").lower() == "true"
 
+        # Step 2: Async save path for heavy optimization runs.
         if async_mode:
             from .tasks import joint_optimize_task
             task = joint_optimize_task.delay(params, save_to_db=True)
@@ -1258,8 +1512,10 @@ def save_joint_batch_optimization(request):
             }, status=status.HTTP_202_ACCEPTED)
 
         # ── Simple queryset — NO prefetch_related needed ──────────────────────
+        # Step 3: Load products participating in optimization.
         products = Product.objects.filter(demand_2024__gt=0)
 
+        # Step 4: Optimize jointly and persist product-level updates.
         result = optimize_product_batches_jointly(
             products,
             params["max_num_batches"],
@@ -1267,6 +1523,7 @@ def save_joint_batch_optimization(request):
             params["max_batch_size"],
         )
 
+        # Step 5: Return optimization output with summary and updated counts.
         return Response({
             "status":           result["status"],
             "message":          result["message"],
