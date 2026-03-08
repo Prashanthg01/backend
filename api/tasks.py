@@ -936,3 +936,180 @@ def _load_balance_score(machine_loads: dict) -> float:
     return round(
         (1 - (max(vals) - min(vals)) / (max(vals) + 1e-9)) * 100, 1
     )
+
+
+@shared_task(bind=True, name="initialize_data_task")
+def initialize_data_task(
+    self,
+    frontpage_csv_path: str | None,
+    process_csv_path: str | None,
+    synthetic_dataset: dict | None = None,
+    clear_existing: bool = True,
+):
+    """
+    Background Celery task that populates master data tables.
+
+    Supports two modes, chosen automatically based on arguments:
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │  Mode A — Real CSV (original behaviour, unchanged)          │
+    │    frontpage_csv_path  ← path to Frontpage.csv              │
+    │    process_csv_path    ← path to Process.csv                │
+    │    synthetic_dataset   = None  (default)                    │
+    ├─────────────────────────────────────────────────────────────┤
+    │  Mode B — Synthetic dataset                                 │
+    │    synthetic_dataset   ← dict from generate_synthetic_dataset│
+    │    frontpage_csv_path  = None  (ignored)                    │
+    │    process_csv_path    = None  (ignored)                    │
+    └─────────────────────────────────────────────────────────────┘
+
+    In both modes the task returns the same result dict so the
+    frontend can handle both identically.
+
+    Step-by-step (Mode A — Real CSV)
+    ---------------------------------
+    1.  Update progress → 10 %
+    2.  Read CSV files into DataFrames
+    3.  Parse demand + routing via process_frontpage_data / process_routing_data
+    4.  Clear existing DB data (if clear_existing=True)
+    5.  Create Machine records
+    6.  Create Product records (batch_size = ceil(demand/12))
+    7.  Create ProcessStep records linked to products and machines
+    8.  Report 100 % and return summary dict
+
+    Step-by-step (Mode B — Synthetic)
+    ----------------------------------
+    1.  Update progress → 10 %
+    2.  Skip CSV reading — dataset already in memory
+    3.  Call insert_synthetic_dataset_into_db() which handles steps 4-7
+    4.  Report 100 % and return summary dict
+    """
+
+    def _progress(pct: int, msg: str) -> None:
+        self.update_state(state="PROGRESS", meta={"progress": pct, "status": msg})
+
+    try:
+        # ── STEP 1: Signal task started ───────────────────────────────────────
+        _progress(10, "Starting initialization…")
+
+        # =====================================================================
+        # MODE B: Synthetic dataset path
+        # =====================================================================
+        if synthetic_dataset is not None:
+            _progress(20, "Loading synthetic dataset into database…")
+
+            from .utils_folder.synthetic_generator import insert_synthetic_dataset_into_db  # noqa
+
+            result = insert_synthetic_dataset_into_db(
+                synthetic_dataset,
+                clear_existing=clear_existing,
+            )
+
+            _progress(100, "Synthetic data initialization complete")
+
+            return {
+                "status":                "success",
+                "message":               "Synthetic database initialized successfully",
+                "dataset_type":          "synthetic",
+                "products_created":      result["products_created"],
+                "machines_created":      result["machines_created"],
+                "process_steps_created": result["process_steps_created"],
+                "metadata":              result.get("metadata", {}),
+            }
+
+        # =====================================================================
+        # MODE A: Real CSV path (original behaviour — unchanged)
+        # =====================================================================
+
+        # ── STEP 2: Read CSV files ────────────────────────────────────────────
+        _progress(10, "Reading CSV files")
+
+        frontpage_df = pd.read_csv(frontpage_csv_path)
+        process_df   = pd.read_csv(process_csv_path)
+        process_df   = process_df.iloc[:, :-2]
+
+        # ── STEP 3: Parse CSV data ────────────────────────────────────────────
+        _progress(30, "Processing data")
+
+        demand_data                    = process_frontpage_data(frontpage_df)
+        process_routing, machines_list = process_routing_data(process_df)
+
+        # ── STEP 4: Clear existing database data ──────────────────────────────
+        _progress(40, "Clearing existing data")
+
+        if clear_existing:
+            Product.objects.all().delete()
+            Machine.objects.all().delete()
+            ProcessStep.objects.all().delete()
+            ProductionSchedule.objects.all().delete()
+
+        # ── STEP 5: Create Machine records ────────────────────────────────────
+        _progress(50, "Creating machines")
+
+        machines: dict = {}
+        for machine_name in machines_list:
+            if machine_name:
+                machines[machine_name] = Machine.objects.create(
+                    name=machine_name,
+                    available_hours_per_day=24,
+                )
+
+        # ── STEP 6: Create Product records ────────────────────────────────────
+        _progress(60, "Creating products")
+
+        total_items = len(demand_data["Item"])
+
+        for i in range(total_items):
+            if i % 10 == 0:
+                progress = 60 + int((i / total_items) * 30)
+                _progress(progress, f"Creating products ({i}/{total_items})")
+
+            item   = demand_data["Item"][i]
+            demand = demand_data["Demand_2024"][i]
+
+            if pd.isna(demand) or demand is None:
+                demand = 0
+
+            batch_size = int(np.ceil(demand / 12)) if demand > 0 else 1
+
+            product = Product.objects.create(
+                item        = item,
+                sap_tn      = str(demand_data["SAP_TN"][i])    if demand_data["SAP_TN"][i]    is not None else "",
+                sap_pl      = str(demand_data["SAP_PL"][i])    if demand_data["SAP_PL"][i]    is not None else None,
+                dcc_type    = demand_data["DCC_Type"][i]       if demand_data["DCC_Type"][i]  is not None else "",
+                description = demand_data["Description"][i]   if demand_data["Description"][i] is not None else "",
+                demand_2024 = int(demand),
+                batch_size  = batch_size,
+                num_batches = 12,
+            )
+
+            # ── STEP 7: Create ProcessStep records ────────────────────────────
+            for step_data in process_routing:
+                if step_data["item"] == item:
+                    machine_name = step_data["machine"]
+                    if machine_name in machines:
+                        ProcessStep.objects.create(
+                            product            = product,
+                            step_number        = step_data["step"],
+                            machine            = machines[machine_name],
+                            step_name          = step_data["name"],
+                            cycle_time_seconds = step_data["time"],
+                            workers_required   = step_data["workers"],
+                        )
+
+        # ── STEP 8: Return summary ────────────────────────────────────────────
+        _progress(100, "Complete")
+
+        return {
+            "status":                "success",
+            "message":               "Database initialized successfully",
+            "dataset_type":          "real",
+            "products_created":      Product.objects.count(),
+            "machines_created":      Machine.objects.count(),
+            "process_steps_created": ProcessStep.objects.count(),
+        }
+
+    except Exception as exc:
+        error_trace = traceback.format_exc()
+        print(error_trace)
+        return {"status": "error", "message": str(exc), "traceback": error_trace}

@@ -1539,3 +1539,178 @@ def save_joint_batch_optimization(request):
         traceback.print_exc()
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from rest_framework import status
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_synthetic_params(request_obj, is_post: bool = True) -> dict:
+    """
+    Extract and validate synthetic-dataset generation parameters.
+
+    Accepts both query-string (GET) and body (POST) parameters so the
+    endpoint is easy to call from the Streamlit UI or curl.
+
+    Returns
+    -------
+    dict with keys:
+        num_products      : int   (default 10,  range 1–200)
+        num_machines      : int | None  (default None → auto)
+        steps_per_product : int | None  (default None → random 3-8)
+        seed              : int   (default 42)
+        demand_min        : int   (default 500)
+        demand_max        : int   (default 50_000)
+        clear_existing    : bool  (default True)
+        async_mode        : bool  (default True)
+    """
+    src = request_obj.data if is_post else request_obj.GET
+
+    def _int(key, default):
+        try:
+            return int(src.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _bool(key, default):
+        v = src.get(key, default)
+        if isinstance(v, bool):
+            return v
+        return str(v).lower() in ("true", "1", "yes")
+
+    num_products = max(1, min(_int("num_products", 10), 200))
+    raw_machines = src.get("num_machines")
+    num_machines = int(raw_machines) if raw_machines not in (None, "", "null") else None
+
+    raw_steps = src.get("steps_per_product")
+    steps_per_product = int(raw_steps) if raw_steps not in (None, "", "null") else None
+
+    seed       = _int("seed", 42)
+    demand_min = max(1, _int("demand_min", 500))
+    demand_max = max(demand_min + 1, _int("demand_max", 50_000))
+
+    return {
+        "num_products":      num_products,
+        "num_machines":      num_machines,
+        "steps_per_product": steps_per_product,
+        "seed":              seed,
+        "demand_range":      (demand_min, demand_max),
+        "clear_existing":    _bool("clear_existing", True),
+        "async_mode":        _bool("async_mode", True),
+    }
+
+
+# ── NEW VIEW ──────────────────────────────────────────────────────────────────
+
+@api_view(["POST"])
+def initialize_synthetic_data(request):
+    """
+    POST /api/initialize-synthetic/
+
+    Generate a synthetic dataset and load it into the database,
+    replacing (or supplementing) real CSV-based data.
+
+    This endpoint is the synthetic counterpart of  POST /api/initialize-data/
+    and produces the same DB state that the full pipeline (scheduler,
+    batch ILP, buffer LP, gap analysis) expects.
+
+    Request body (all optional)
+    ---------------------------
+    num_products      int   Products to generate            default 10
+    num_machines      int   Machines to include             default auto
+    steps_per_product int   Routing depth per product       default random 3-8
+    seed              int   RNG seed (reproducibility)      default 42
+    demand_min        int   Minimum annual demand           default 500
+    demand_max        int   Maximum annual demand           default 50 000
+    clear_existing    bool  Wipe existing data first        default true
+    async_mode        bool  Run in background via Celery    default true
+
+    Returns (202 async)
+    -------------------
+    { task_id, status, message, check_status_url }
+
+    Returns (200 sync — async_mode=false)
+    --------------------------------------
+    {
+      message, dataset_type, products_created, machines_created,
+      process_steps_created, metadata
+    }
+
+    Step-by-step
+    ------------
+    1.  Parse and validate generation parameters.
+    2.  Call generate_synthetic_dataset() to build the in-memory dataset.
+    3.  Async path  → enqueue initialize_data_task with synthetic_dataset kwarg.
+    4.  Sync path   → call insert_synthetic_dataset_into_db() directly.
+    5.  Return creation summary + metadata for reproducibility tracing.
+    """
+    try:
+        # ── STEP 1: Parse parameters ──────────────────────────────────────────
+        params = _parse_synthetic_params(request, is_post=True)
+        async_mode     = params.pop("async_mode")
+        clear_existing = params.pop("clear_existing")
+
+        # ── STEP 2: Generate dataset in memory ────────────────────────────────
+        # This is fast (<1 s) regardless of num_products, so we always do it
+        # synchronously even in async mode (task only handles DB writes).
+        from .utils_folder.synthetic_generator import (  # noqa
+            generate_synthetic_dataset,
+            insert_synthetic_dataset_into_db,
+        )
+
+        dataset = generate_synthetic_dataset(
+            num_products      = params["num_products"],
+            num_machines      = params["num_machines"],
+            steps_per_product = params["steps_per_product"],
+            seed              = params["seed"],
+            demand_range      = params["demand_range"],
+        )
+
+        # ── STEP 3: Async path ────────────────────────────────────────────────
+        if async_mode:
+            from api.tasks import initialize_data_task  # noqa
+
+            # Pass the pre-generated dataset dict directly to the Celery task.
+            # The task receives synthetic_dataset and skips CSV file reading.
+            task = initialize_data_task.delay(
+                frontpage_csv_path = None,
+                process_csv_path   = None,
+                synthetic_dataset  = dataset,
+                clear_existing     = clear_existing,
+            )
+
+            return Response(
+                {
+                    "task_id":          task.id,
+                    "status":           "processing",
+                    "message":          (
+                        f"Synthetic dataset generation started — "
+                        f"{params['num_products']} products, seed={params['seed']}"
+                    ),
+                    "check_status_url": f"/api/task-status/{task.id}/",
+                    "metadata":         dataset["metadata"],
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        # ── STEP 4: Sync path ─────────────────────────────────────────────────
+        result = insert_synthetic_dataset_into_db(dataset, clear_existing=clear_existing)
+
+        # ── STEP 5: Return summary ────────────────────────────────────────────
+        return Response(
+            {
+                "message":               "Synthetic database initialized successfully",
+                "dataset_type":          "synthetic",
+                "products_created":      result["products_created"],
+                "machines_created":      result["machines_created"],
+                "process_steps_created": result["process_steps_created"],
+                "metadata":              result["metadata"],
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    except Exception as exc:
+        import traceback  # noqa
+        traceback.print_exc()
+        return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
