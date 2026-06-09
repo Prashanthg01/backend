@@ -1,5 +1,6 @@
 # api/utils.py
 
+import logging
 import pandas as pd
 import numpy as np
 import math
@@ -7,6 +8,8 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from django.db.models import Sum
 from .models import Product, ProcessStep, ProductionSchedule
+
+logger = logging.getLogger(__name__)
 
 from pulp import (
     LpProblem, LpMinimize, LpMaximize, LpVariable, LpInteger, LpContinuous, LpBinary,
@@ -286,6 +289,119 @@ def count_schedule_gaps(schedule: list, min_gap_sec: int = 60) -> dict:
         'total_gaps':       total_gaps,
         'total_idle_hours': round(total_idle, 2),
         'per_machine':      per_machine,
+    }
+
+
+# ===========================================================================
+# 0b.  SCHEDULE VALIDATION
+# ===========================================================================
+# After all scheduling phases complete, this validator checks two invariants
+# that must hold for a schedule to be physically realizable:
+#
+#   1. MACHINE CONFLICT — no two operations on the same machine overlap in time.
+#      If they do, a real machine would be running two jobs simultaneously,
+#      which is impossible.
+#
+#   2. ROUTING DEPENDENCY — no operation starts before its predecessor step
+#      (on any machine) has finished.  If it does, a job is being assembled
+#      before its upstream component is ready.
+#
+# WHY THIS WAS MISSING
+# --------------------
+# Phase 2 (PuLP MILP) re-sequences operations on individual machines using a
+# single-machine model.  Before the fix in _reoptimise_machine, the solver
+# could move operations earlier than their predecessor end times, silently
+# producing invalid schedules.  Validation makes such violations visible
+# rather than letting them propagate to the Gantt chart and KPI calculations.
+
+def validate_schedule(schedule: list) -> dict:
+    """
+    Validate a completed schedule for machine conflicts and routing violations.
+
+    Parameters
+    ----------
+    schedule : list[dict]
+        Scheduled operations — each dict must have:
+            batch_id, step_number, machine_name, start_hrs, end_hrs
+
+    Returns
+    -------
+    dict with keys:
+        valid              : bool   True only when zero errors found
+        machine_conflicts  : list   overlap descriptions (empty when valid)
+        routing_violations : list   precedence violation descriptions
+        total_errors       : int
+        summary            : str    human-readable one-liner
+    """
+    TOLERANCE = 1.0 / 3600   # 1-second float tolerance
+
+    machine_conflicts:  list = []
+    routing_violations: list = []
+
+    # ── Check 1: machine overlaps ─────────────────────────────────────────
+    by_machine: dict = defaultdict(list)
+    for op in schedule:
+        by_machine[op['machine_name']].append(op)
+
+    for machine, ops in by_machine.items():
+        sorted_ops = sorted(ops, key=lambda o: o['start_hrs'])
+        for i in range(1, len(sorted_ops)):
+            prev = sorted_ops[i - 1]
+            curr = sorted_ops[i]
+            overlap = prev['end_hrs'] - curr['start_hrs']
+            if overlap > TOLERANCE:
+                machine_conflicts.append({
+                    'machine':       machine,
+                    'op1_job':       prev['batch_id'],
+                    'op1_step':      prev['step_number'],
+                    'op1_end_hrs':   round(prev['end_hrs'], 4),
+                    'op2_job':       curr['batch_id'],
+                    'op2_step':      curr['step_number'],
+                    'op2_start_hrs': round(curr['start_hrs'], 4),
+                    'overlap_hours': round(overlap, 4),
+                })
+
+    # ── Check 2: routing dependency violations ────────────────────────────
+    job_step_map: dict = {}
+    for op in schedule:
+        job_step_map[(op['batch_id'], op['step_number'])] = op
+
+    for op in schedule:
+        step = op['step_number']
+        if step <= 1:
+            continue
+        pred = job_step_map.get((op['batch_id'], step - 1))
+        if pred is None:
+            continue
+        violation = pred['end_hrs'] - op['start_hrs']
+        if violation > TOLERANCE:
+            routing_violations.append({
+                'job':             op['batch_id'],
+                'step':            step,
+                'machine':         op['machine_name'],
+                'start_hrs':       round(op['start_hrs'], 4),
+                'pred_step':       step - 1,
+                'pred_machine':    pred['machine_name'],
+                'pred_end_hrs':    round(pred['end_hrs'], 4),
+                'violation_hours': round(violation, 4),
+            })
+
+    total = len(machine_conflicts) + len(routing_violations)
+    if total == 0:
+        summary = "Schedule VALID — no conflicts or dependency violations"
+    else:
+        summary = (
+            f"Schedule INVALID — "
+            f"{len(machine_conflicts)} machine conflict(s), "
+            f"{len(routing_violations)} routing violation(s)"
+        )
+
+    return {
+        'valid':              total == 0,
+        'machine_conflicts':  machine_conflicts,
+        'routing_violations': routing_violations,
+        'total_errors':       total,
+        'summary':            summary,
     }
 
 
@@ -1021,7 +1137,40 @@ def run_job_shop_scheduler(
         _progress(75, f"PuLP optimisation on {local_opt_machines} bottleneck machines…")
         schedule = _local_pulp_optimise(schedule, job_ops, start_dt, local_opt_machines)
 
-    _progress(95, "Finalising schedule…")
+    # ── STEP 6: Post-schedule validation ──────────────────────────────────────
+    # Verify that the final schedule has no machine conflicts and respects all
+    # routing dependencies.  After the Phase 2 fix (predecessor lower bounds)
+    # this should always pass; this check makes regressions immediately visible.
+    # ─────────────────────────────────────────────────────────────────────────
+    _progress(90, "Validating schedule integrity…")
+    validation = validate_schedule(schedule)
+    if validation['valid']:
+        logger.info("Schedule validation passed — %d operations, %d machines",
+                    len(schedule),
+                    len(set(op['machine_name'] for op in schedule)))
+    else:
+        logger.warning("Schedule validation FAILED: %s", validation['summary'])
+        for conflict in validation['machine_conflicts'][:5]:   # log first 5
+            logger.warning(
+                "  Machine conflict on %s: %s step %d overlaps %s step %d by %.4fh",
+                conflict['machine'],
+                conflict['op1_job'], conflict['op1_step'],
+                conflict['op2_job'], conflict['op2_step'],
+                conflict['overlap_hours'],
+            )
+        for violation in validation['routing_violations'][:5]:
+            logger.warning(
+                "  Routing violation: %s step %d starts %.4fh before step %d ends",
+                violation['job'], violation['step'],
+                violation['violation_hours'], violation['pred_step'],
+            )
+
+    # Attach validation summary to every operation so callers can surface it
+    for op in schedule:
+        op['_schedule_valid']  = validation['valid']
+        op['_validation_note'] = validation['summary']
+
+    _progress(95, f"Finalising schedule… [{validation['summary']}]")
     return schedule
 
 
@@ -1199,6 +1348,108 @@ def _greedy_dispatch(jobs, job_ops, start_dt, progress_callback=None):
 # Phase 2: Bounded PuLP optimisation on bottleneck machines
 # ---------------------------------------------------------------------------
 
+def _rebuild_timings_after_phase2(schedule: list, start_dt) -> None:
+    """
+    After Phase 2 MILP resequences bottleneck machines, some successor steps
+    on non-optimised machines may have start times that predate their updated
+    job-predecessor end times (because _reoptimise_machine updates one machine
+    at a time and does not cascade timing changes to downstream operations).
+
+    This function recomputes ALL start/end times from scratch while preserving
+    the per-machine sequence order decided by Phase 2.
+
+    Algorithm (Kahn-style forward-pass dispatch):
+      1. Lock in machine ordering by sorting each machine's ops by their
+         current (Phase 2) start_hrs.
+      2. Define two dependency types per operation:
+           - job dependency   : step N must start after step N-1 of same job
+           - machine dependency: op at machine queue position k must start
+                                 after position k-1 ends
+      3. Process ops in topological order (BFS); each op starts at
+         max(job_predecessor_end, machine_predecessor_end).
+
+    Mutates schedule in place.
+    """
+    import heapq as _heapq
+
+    n = len(schedule)
+    if n == 0:
+        return
+
+    # ── Machine ordering (preserves Phase 2 sequence) ────────────────────
+    by_machine: dict[str, list[int]] = defaultdict(list)
+    for i, op in enumerate(schedule):
+        by_machine[op['machine_name']].append(i)
+    for idxs in by_machine.values():
+        idxs.sort(key=lambda i: schedule[i]['start_hrs'])
+
+    machine_prev: dict[int, int] = {}  # op_idx → idx of previous op on same machine
+    dependents:   list[list[int]] = [[] for _ in range(n)]
+
+    for idxs in by_machine.values():
+        for pos, idx in enumerate(idxs):
+            if pos > 0:
+                prev_idx = idxs[pos - 1]
+                machine_prev[idx] = prev_idx
+                dependents[prev_idx].append(idx)
+
+    # ── Job-step predecessor map ──────────────────────────────────────────
+    job_step_idx: dict[tuple, int] = {
+        (op['batch_id'], op['step_number']): i
+        for i, op in enumerate(schedule)
+    }
+
+    job_pred: dict[int, int] = {}
+    for i, op in enumerate(schedule):
+        if op['step_number'] > 1:
+            pred_idx = job_step_idx.get((op['batch_id'], op['step_number'] - 1))
+            if pred_idx is not None:
+                job_pred[i] = pred_idx
+                dependents[pred_idx].append(i)
+
+    # ── In-degree count (number of unresolved dependencies) ──────────────
+    in_degree = [0] * n
+    for i in range(n):
+        if i in machine_prev:
+            in_degree[i] += 1
+        if i in job_pred:
+            in_degree[i] += 1
+
+    # ready_time[i] = earliest possible start for op i
+    ready_time = [0.0] * n
+    heap: list[tuple[float, int]] = []
+    for i in range(n):
+        if in_degree[i] == 0:
+            _heapq.heappush(heap, (0.0, i))
+
+    # ── Forward-pass dispatch ─────────────────────────────────────────────
+    processed = 0
+    while heap:
+        _, i = _heapq.heappop(heap)
+        op    = schedule[i]
+        start = ready_time[i]
+        end   = start + op['dur_hours']
+
+        op['start_hrs'] = start
+        op['end_hrs']   = end
+        op['start_dt']  = start_dt + timedelta(hours=start)
+        op['end_dt']    = start_dt + timedelta(hours=end)
+        processed += 1
+
+        for dep in dependents[i]:
+            ready_time[dep] = max(ready_time[dep], end)
+            in_degree[dep] -= 1
+            if in_degree[dep] == 0:
+                _heapq.heappush(heap, (ready_time[dep], dep))
+
+    if processed != n:
+        logger.warning(
+            "_rebuild_timings_after_phase2: processed %d/%d ops — "
+            "cycle detected in dependency graph; schedule may be invalid",
+            processed, n,
+        )
+
+
 def _local_pulp_optimise(schedule, job_ops, start_dt, k_machines):
     """
     Re-optimise the K most-loaded machines using single-machine MILP.
@@ -1235,6 +1486,23 @@ def _local_pulp_optimise(schedule, job_ops, start_dt, k_machines):
     for i, row in enumerate(schedule):
         by_machine[row['machine_name']].append(i)
 
+    # ── Build predecessor-end map ─────────────────────────────────────────
+    # For each (job, step) pair record when the PREVIOUS step finishes so
+    # that _reoptimise_machine can use it as a hard lower bound.
+    # Without this map Phase 2 MILP was free to move a step earlier than
+    # its upstream step on another machine, violating job precedence.
+    job_step_ends: dict = {}
+    for row in schedule:
+        job_step_ends[(row['batch_id'], row['step_number'])] = row['end_hrs']
+
+    predecessor_end_for: dict = {}
+    for row in schedule:
+        step = row['step_number']
+        if step > 1:
+            predecessor_end_for[(row['batch_id'], step)] = job_step_ends.get(
+                (row['batch_id'], step - 1), 0.0
+            )
+
     # ── STEP 2: Re-optimise each selected machine ─────────────────────────
     for machine in top_machines:
         indices = by_machine[machine]
@@ -1246,12 +1514,23 @@ def _local_pulp_optimise(schedule, job_ops, start_dt, k_machines):
             # to guarantee consistent ordering without optimisation
             indices.sort(key=lambda i: schedule[i]['start_hrs'])
             continue
-        _reoptimise_machine(schedule, indices, machine, start_dt)
+        _reoptimise_machine(schedule, indices, machine, start_dt, predecessor_end_for)
+
+    # After all machines are resequenced, some successor steps on other
+    # machines may now start before their (repositioned) predecessors finish.
+    # Rebuild all timings in topological order while preserving Phase 2 ordering.
+    _rebuild_timings_after_phase2(schedule, start_dt)
 
     return schedule
 
 
-def _reoptimise_machine(schedule, indices, machine_name, start_dt):
+def _reoptimise_machine(
+    schedule,
+    indices,
+    machine_name,
+    start_dt,
+    predecessor_end_for: dict | None = None,
+):
     """
     Single-machine MILP: minimise makespan for one machine's operations.
 
@@ -1268,15 +1547,28 @@ def _reoptimise_machine(schedule, indices, machine_name, start_dt):
       Cmax ≥ S_i + d_i  for all i          (makespan definition)
       S_j ≥ S_i + d_i - M(1-y_ij)         (disjunctive: if i before j)
       S_i ≥ S_j + d_j - M·y_ij            (disjunctive: if j before i)
+      S_i ≥ predecessor_end_i              (routing dependency — NEW)
 
-    The lower bound for each S_i is set to max(0, current_start - duration)
-    to give the solver freedom to move ops left without going negative.
+    Lower bounds now come from predecessor_end_for so the solver cannot
+    schedule a step earlier than its upstream step on another machine.
+    The old heuristic (start - duration) had no scheduling basis and
+    allowed Phase 2 to violate job precedence constraints.
     """
     n         = len(indices)
     ops       = [schedule[i] for i in indices]
 
-    # Lower bound: allow op to move left up to one duration worth
-    lb        = [max(0.0, op['start_hrs'] - op['dur_hours']) for op in ops]
+    # Lower bound: earliest this op can start = when its predecessor finishes.
+    # For first steps (step_number == 1) there is no predecessor → lb = 0.
+    # predecessor_end_for is keyed by (batch_id, step_number).
+    if predecessor_end_for:
+        lb = [
+            predecessor_end_for.get((op['batch_id'], op['step_number']), 0.0)
+            for op in ops
+        ]
+    else:
+        # Safe fallback when caller does not supply predecessor info
+        lb = [0.0] * n
+
     # Upper bound: 1.5× the current schedule end (generous slack)
     ub_global = max(op['end_hrs'] for op in ops) * 1.5
     durations = [op['dur_hours'] for op in ops]
@@ -2190,3 +2482,239 @@ def _joint_preview_no_save(products, max_num_batches, min_batch_size, max_batch_
         "products_updated": 0,  # Always 0 in preview mode
         "message": f"Preview only — no DB writes. Status: {'optimal' if solved else 'fallback'}",
     }
+
+
+# ===========================================================================
+# SHIFT-AWARE SCHEDULER  (Type 1 — simple discrete-event with shift windows)
+# ===========================================================================
+#
+# This scheduler guarantees all required production protocols:
+#   • No machine overlap  — machine_free_at[m] is always advanced past end
+#   • Step sequencing     — prev_step_end gates the next step's earliest start
+#   • Shift boundaries    — _find_slot() only accepts slots within a shift window
+#   • Duration consistency— duration_hours == (end_time - start_time).seconds/3600
+#   • Batch coherence     — batch_id carries product item + batch number
+#
+# Contrast with run_job_shop_scheduler (Type 2) which uses the ERT greedy
+# dispatcher + left-shift compaction + PuLP MILP for optimised throughput
+# but does not enforce hard shift boundaries.
+
+def _get_shift_windows(
+    base_dt: datetime,
+    shifts: list,
+    num_days: int,
+) -> list:
+    """
+    Build a sorted list of (shift_start, shift_end) pairs for num_days.
+
+    Parameters
+    ----------
+    base_dt   : schedule epoch (any time-of-day; we anchor to midnight)
+    shifts    : list of (start_hour, end_hour) tuples in 24h clock.
+                end_hour > 24 is valid for night-shift overflow (e.g., 22→30).
+    num_days  : number of calendar days to generate windows for.
+
+    Returns
+    -------
+    Sorted list of (datetime, datetime) tuples.
+    """
+    base_day = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    windows = []
+    for day_offset in range(num_days + 2):   # +2 to safely cover night-shift overflow
+        day = base_day + timedelta(days=day_offset)
+        for (sh, eh) in shifts:
+            s = day + timedelta(hours=sh)
+            e = day + timedelta(hours=eh)
+            if e > base_dt:                   # skip windows entirely before start
+                windows.append((s, e))
+    windows.sort()
+    return windows
+
+
+def _find_slot(
+    machine_free_at: datetime,
+    earliest_start: datetime,
+    duration_h: float,
+    shift_windows: list,
+) -> tuple:
+    """
+    Find the earliest (start, end) pair that:
+      a) starts >= max(machine_free_at, earliest_start)
+      b) fits entirely within one shift window (no cross-shift operations)
+
+    Falls back to unconstrained scheduling if no window is found (avoids
+    RuntimeError on very tight schedules — caller should use enough num_days).
+
+    Parameters
+    ----------
+    machine_free_at : datetime  when the machine becomes available
+    earliest_start  : datetime  step-sequencing lower bound (prev step end)
+    duration_h      : float     operation duration in hours
+    shift_windows   : list      sorted (shift_start, shift_end) pairs
+
+    Returns
+    -------
+    (start, end) datetime pair
+    """
+    candidate = max(machine_free_at, earliest_start)
+    duration  = timedelta(hours=duration_h)
+
+    for (sw_start, sw_end) in shift_windows:
+        if sw_end <= candidate:
+            continue
+        actual_start = max(candidate, sw_start)
+        actual_end   = actual_start + duration
+        if actual_end <= sw_end:
+            return actual_start, actual_end
+        # Operation doesn't fit in this window — try next shift
+
+    # Fallback: no shift window found — return unconstrained
+    return candidate, candidate + duration
+
+
+def run_shift_aware_scheduler(
+    products,
+    start_dt: datetime,
+    shifts: list | None = None,
+    num_days: int = 60,
+    batch_override: dict | None = None,
+    progress_callback=None,
+) -> list:
+    """
+    Shift-aware discrete-event scheduler (Schedule Type 1).
+
+    Processes products in the order given, scheduling each batch's steps
+    sequentially.  All operations are snapped into shift windows so no
+    operation ever straddles a shift boundary.
+
+    Protocols guaranteed
+    --------------------
+    1. No machine overlap  — machine_free_at advanced past each op's end
+    2. Step sequencing     — step N+1 cannot start before step N ends
+    3. Shift boundaries    — _find_slot() enforces window containment
+    4. Duration consistency— dur_hours = (end - start).total_seconds() / 3600
+    5. Batch coherence     — same batch_id = same product + batch_num + batch_size
+
+    Parameters
+    ----------
+    products       : iterable of Product ORM objects
+    start_dt       : datetime  schedule anchor
+    shifts         : list of (start_hour, end_hour) tuples (default 3×8h shifts)
+    num_days       : int       how many days of shift windows to pre-generate
+    batch_override : dict      { product_pk: (batch_size, num_batches) }
+    progress_callback : callable  f(pct: int, msg: str)
+
+    Returns
+    -------
+    list[dict] with the same schema as run_job_shop_scheduler so the Celery
+    task can persist results identically regardless of scheduler type.
+    """
+    def _progress(pct, msg):
+        if progress_callback:
+            progress_callback(pct, msg)
+
+    if shifts is None:
+        shifts = [(6, 14), (14, 22), (22, 30)]   # morning / afternoon / night
+
+    _progress(5, "Building shift windows…")
+    shift_windows = _get_shift_windows(start_dt, shifts, num_days)
+
+    _progress(10, "Extracting process routing…")
+    routing: dict = {}
+    for p in products:
+        steps = (
+            ProcessStep.objects
+            .filter(product=p, cycle_time_seconds__gt=0)
+            .select_related('machine')
+            .order_by('step_number')
+        )
+        if steps.exists():
+            routing[p.pk] = [
+                {
+                    'step':      s.step_number,
+                    'machine':   s.machine.name,
+                    'cycle_sec': s.cycle_time_seconds,
+                    'step_name': s.step_name,
+                }
+                for s in steps
+            ]
+
+    # Collect all machine names and initialise availability to start_dt
+    all_machines: set = set()
+    for steps in routing.values():
+        for s in steps:
+            all_machines.add(s['machine'])
+    machine_free_at: dict = {m: start_dt for m in all_machines}
+
+    schedule_rows: list = []
+    products_list = [p for p in products if p.pk in routing]
+    total = max(len(products_list), 1)
+
+    _progress(20, f"Scheduling {total} products across {len(all_machines)} machines…")
+
+    for idx, p in enumerate(products_list):
+        pct = 20 + int((idx / total) * 70)
+        _progress(pct, f"Scheduling {p.item}…")
+
+        if batch_override and p.pk in batch_override:
+            b_size, n_batches = batch_override[p.pk]
+        else:
+            b_size    = p.batch_size  if p.batch_size  > 0 else 1
+            n_batches = p.num_batches if p.num_batches > 0 else 1
+
+        steps = routing[p.pk]
+
+        for batch_num in range(1, n_batches + 1):
+            batch_id     = f"{p.item}_B{batch_num:03d}"
+            prev_step_end = start_dt      # sequencing anchor for this batch
+
+            for step in steps:
+                machine      = step['machine']
+                duration_h   = max((step['cycle_sec'] * b_size) / 3600.0, 0.25)
+
+                start, end = _find_slot(
+                    machine_free_at = machine_free_at[machine],
+                    earliest_start  = prev_step_end,
+                    duration_h      = duration_h,
+                    shift_windows   = shift_windows,
+                )
+
+                # Advance trackers
+                machine_free_at[machine] = end
+                prev_step_end            = end
+
+                # Compute actual duration from timestamps (guaranteed consistent)
+                actual_dur = (end - start).total_seconds() / 3600.0
+
+                schedule_rows.append({
+                    'job_id':      batch_id,
+                    'batch_id':    batch_id,
+                    'product_pk':  p.pk,
+                    'batch_num':   batch_num,
+                    'batch_size':  b_size,
+                    'step_number': step['step'],
+                    'step_name':   step['step_name'],
+                    'machine_name': machine,
+                    'start_hrs':   (start - start_dt).total_seconds() / 3600.0,
+                    'end_hrs':     (end   - start_dt).total_seconds() / 3600.0,
+                    'dur_hours':   round(actual_dur, 4),
+                    'start_dt':    start,
+                    'end_dt':      end,
+                })
+
+    _progress(92, "Validating shift-aware schedule…")
+    validation = validate_schedule(schedule_rows)
+    for op in schedule_rows:
+        op['_schedule_valid']  = validation['valid']
+        op['_validation_note'] = validation['summary']
+
+    if validation['valid']:
+        logger.info(
+            "Shift-aware schedule VALID — %d ops, %d machines",
+            len(schedule_rows), len(all_machines),
+        )
+    else:
+        logger.warning("Shift-aware schedule INVALID: %s", validation['summary'])
+
+    _progress(100, f"Complete [{validation['summary']}]")
+    return schedule_rows

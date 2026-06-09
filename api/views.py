@@ -21,7 +21,7 @@ from .utils import (
     calculate_production_outputs, SHIFT_LABELS, build_summary,
     process_frontpage_data, process_routing_data,
     calculate_optimal_batch_size, pulp_optimize_buffers,
-    optimize_product_batches_jointly
+    optimize_product_batches_jointly, validate_schedule,
 )
 from .tasks import (
     initialize_data_task,
@@ -761,10 +761,12 @@ def generate_schedule(request):
         params = {
             'start_date':          request.data.get('start_date'),
             'local_opt_machines':  int(request.data.get('local_opt_machines', 5)),
-            'enable_compaction':   bool(request.data.get('enable_compaction', True)),  # ← NEW
+            'enable_compaction':   bool(request.data.get('enable_compaction', True)),
             'clear_existing':      request.data.get('clear_existing', True),
             'product_pks':         request.data.get('product_pks'),
             'batch_overrides':     request.data.get('batch_overrides', []),
+            # 1 = Shift-Aware (respects shift windows), 2 = ERT+PuLP (default)
+            'schedule_type':       int(request.data.get('schedule_type', 2)),
         }
 
         async_mode = str(request.data.get('async_mode', 'true')).lower() == 'true'
@@ -780,7 +782,7 @@ def generate_schedule(request):
             }, status=status.HTTP_202_ACCEPTED)
 
         # Step 4: Sync fallback runs scheduler in-request.
-        from .utils import run_job_shop_scheduler, compute_schedule_kpis
+        from .utils import run_job_shop_scheduler, run_shift_aware_scheduler, compute_schedule_kpis
         from datetime import datetime
 
         start_str = params.get('start_date')
@@ -788,12 +790,15 @@ def generate_schedule(request):
             hour=0, minute=0, second=0, microsecond=0
         )
         products = list(Product.objects.filter(demand_2024__gt=0))
-        rows     = run_job_shop_scheduler(
-            products,
-            start_dt,
-            local_opt_machines = params['local_opt_machines'],
-            enable_compaction  = params['enable_compaction'],   # ← NEW
-        )
+        if params.get('schedule_type', 2) == 1:
+            rows = run_shift_aware_scheduler(products, start_dt)
+        else:
+            rows = run_job_shop_scheduler(
+                products,
+                start_dt,
+                local_opt_machines = params['local_opt_machines'],
+                enable_compaction  = params['enable_compaction'],
+            )
         # Step 5: Compute KPI summary from generated operation rows.
         makespan = max(r['end_hrs'] for r in rows) if rows else 0
         kpis     = compute_schedule_kpis(rows, makespan)

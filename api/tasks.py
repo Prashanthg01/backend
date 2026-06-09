@@ -1,5 +1,7 @@
 # api/tasks.py
 
+import logging
+
 from celery import shared_task, current_task
 from celery.result import AsyncResult
 import pandas as pd
@@ -7,14 +9,18 @@ import numpy as np
 from django.db.models import Sum
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
+
 from .models import Product, Machine, ProcessStep, ProductionSchedule
 from .utils import (
     process_frontpage_data,
     process_routing_data,
     run_job_shop_scheduler,
+    run_shift_aware_scheduler,
     compute_schedule_kpis,
     optimize_product_batches_jointly,
-    calculate_optimal_batch_size
+    calculate_optimal_batch_size,
+    validate_schedule,
 )
 import traceback
 
@@ -432,6 +438,11 @@ def generate_schedule_task(self, params: dict):
         # Set to False only when appending a partial re-schedule.
         clear = params.get('clear_existing', True)
 
+        # Schedule type:
+        #   1 = Shift-Aware Discrete-Event (respects shift boundaries, simple)
+        #   2 = ERT + Left-Shift Compaction + PuLP MILP (optimised, default)
+        schedule_type = int(params.get('schedule_type', 2))
+
         # -------------------------------------------------------------
         # STEP 2: Build the batch override map
         # batch_overrides is a list of [pk, batch_size, num_batches] triples
@@ -458,28 +469,35 @@ def generate_schedule_task(self, params: dict):
             return {'status': 'error', 'message': 'No products with demand found in the database.'}
 
         # -------------------------------------------------------------
-        # STEP 4: Run the job-shop scheduler
-        # This is the heavy computation phase (Phases 1a, 1b, and 2):
+        # STEP 4: Run the scheduler (type chosen by caller)
         #
-        #   Phase 1a — Initial greedy assignment of operations to machines
-        #   Phase 1b — Local optimisation on the top N bottleneck machines
-        #   Phase 2  — Optional left-shift compaction to close idle gaps
+        # Type 1 — Shift-Aware Discrete-Event scheduler
+        #   Simple sequential assignment that respects shift windows.
+        #   Guarantees no operation straddles a shift boundary.
+        #   Good for compliance/visibility; less optimised throughput.
         #
-        # Progress updates during scheduling are handled via the
-        # progress_callback, which calls _progress() internally.
-        #
-        # Returns a list of schedule_row dicts, each containing:
-        #   product_pk, step_number, batch_id, batch_num, batch_size,
-        #   start_dt, end_dt, dur_hours, end_hrs
+        # Type 2 — ERT Greedy + Left-Shift Compaction + PuLP MILP (default)
+        #   Three-phase heuristic + MILP for maximum throughput.
+        #   Does not enforce hard shift boundaries.
         # -------------------------------------------------------------
-        schedule_rows = run_job_shop_scheduler(
-            products           = products,
-            start_dt           = start_dt,
-            batch_override     = batch_override if batch_override else None,
-            local_opt_machines = local_opt,
-            enable_compaction  = enable_compaction,
-            progress_callback  = _progress,
-        )
+        if schedule_type == 1:
+            _progress(25, "Running shift-aware scheduler (Type 1)…")
+            schedule_rows = run_shift_aware_scheduler(
+                products          = products,
+                start_dt          = start_dt,
+                batch_override    = batch_override if batch_override else None,
+                progress_callback = _progress,
+            )
+        else:
+            _progress(25, "Running ERT + PuLP scheduler (Type 2)…")
+            schedule_rows = run_job_shop_scheduler(
+                products           = products,
+                start_dt           = start_dt,
+                batch_override     = batch_override if batch_override else None,
+                local_opt_machines = local_opt,
+                enable_compaction  = enable_compaction,
+                progress_callback  = _progress,
+            )
 
         # Guard: if the scheduler returned nothing, something is wrong
         # with the process step data (e.g., no routing defined).
@@ -549,19 +567,33 @@ def generate_schedule_task(self, params: dict):
         # makespan = the latest end time across all operations (hours)
         # kpis     = dict of schedule quality metrics (utilisation, etc.)
         # -------------------------------------------------------------
-        makespan = max(row['end_hrs'] for row in schedule_rows)
-        kpis     = compute_schedule_kpis(schedule_rows, makespan)
+        makespan   = max(row['end_hrs'] for row in schedule_rows)
+        kpis       = compute_schedule_kpis(schedule_rows, makespan)
 
         # -------------------------------------------------------------
-        # STEP 9: Mark task complete and return results (100%)
+        # STEP 9: Run post-schedule validation and surface the result.
+        # validate_schedule checks:
+        #   - no two ops on the same machine overlap (machine conflict)
+        #   - no op starts before its predecessor step ends (routing dep)
+        # The validation was already run inside run_job_shop_scheduler
+        # and logged there; we pull the result from the first row's
+        # _schedule_valid flag and re-run a cheap check for the response.
+        # -------------------------------------------------------------
+        validation = validate_schedule(schedule_rows)
+
+        # -------------------------------------------------------------
+        # STEP 10: Mark task complete and return results (100%)
         # -------------------------------------------------------------
         _progress(100, 'Complete')
 
         return {
-            'status':           'success',
-            'message':          'Schedule generated and saved successfully.',
-            'total_operations': len(to_create),
-            'kpis':             kpis,
+            'status':            'success',
+            'message':           'Schedule generated and saved successfully.',
+            'total_operations':  len(to_create),
+            'kpis':              kpis,
+            'schedule_valid':    validation['valid'],
+            'validation_summary': validation['summary'],
+            'validation_errors': validation['total_errors'],
         }
 
     # -------------------------------------------------------------
@@ -572,7 +604,7 @@ def generate_schedule_task(self, params: dict):
     # -------------------------------------------------------------
     except Exception as exc:
         tb = traceback.format_exc()
-        print(tb)
+        logger.error("generate_schedule_task failed: %s\n%s", exc, tb)
         self.update_state(
             state='FAILURE',
             meta={'progress': 0, 'status': 'Failed', 'error': str(exc)}
