@@ -1,15 +1,19 @@
 """
 api/utils_folder/synthetic_generator.py
 
-Enhanced synthetic dataset generator using rich machine, product, and
-process-step grammars from the production scheduler research notebook.
+Synthetic dataset generator with named scenario profiles.
 
-Machines have realistic role-based names (cutting/assembly/molding),
-products use wire+connector nomenclature, and process steps follow
-a factory flow with category-specific operations and qualifiers.
+Machines have realistic role-based names (cutting / assembly / molding),
+products use wire-harness nomenclature, and process steps follow a factory
+flow with category-specific operations and qualifiers.
 
-All random values are seeded for reproducibility:
-    dataset = generate_synthetic_dataset(num_products=12, seed=42)
+Public API
+----------
+SCENARIO_CATALOG          : dict    – named scenario profiles (backend source of truth)
+get_scenario_catalog()    : dict    – serialisable copy of SCENARIO_CATALOG
+generate_synthetic_dataset()        – low-level generator (full parameter control)
+generate_scenario_dataset()         – named-scenario shortcut
+insert_synthetic_dataset_into_db()  – persist a generated dataset into Django ORM
 """
 from __future__ import annotations
 
@@ -18,6 +22,113 @@ import random
 import string
 import time
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# Scenario Catalog  (backend source of truth for all four profiles)
+# ---------------------------------------------------------------------------
+
+SCENARIO_CATALOG: dict[str, dict] = {
+    "Low Demand / High Availability": {
+        "icon":     "🟢",
+        "color":    "#22c55e",
+        "subtitle": "Slack capacity — baseline stress-free scenario",
+        "description": (
+            "Few products with modest demand scheduled across a generous machine pool. "
+            "Machines run well below capacity, producing short makespans with no bottlenecks. "
+            "Use this as a sanity-check baseline or to tune scheduler parameters."
+        ),
+        "tags":    ["baseline", "slack", "easy"],
+        "params":  {
+            "num_products":      5,
+            "num_machines":      8,
+            "demand_min":       100,
+            "demand_max":     2_000,
+            "steps_per_product": 3,
+            "seed":             42,
+        },
+        "expected": {
+            "Avg utilisation":  "< 40%",
+            "Makespan":         "Short",
+            "Bottleneck risk":  "Low",
+            "Scheduling style": "Easy dispatch",
+        },
+    },
+    "High Demand / Bottleneck Machines": {
+        "icon":     "🔴",
+        "color":    "#ef4444",
+        "subtitle": "Demand spike on constrained machines",
+        "description": (
+            "Many products with high annual demand all competing for a small set of machines. "
+            "At least one machine will hit critical utilisation (>85%). "
+            "Tests the scheduler's ability to sequence under heavy load and PuLP optimisation."
+        ),
+        "tags":    ["bottleneck", "stress", "hard"],
+        "params":  {
+            "num_products":      20,
+            "num_machines":       3,
+            "demand_min":    10_000,
+            "demand_max":   100_000,
+            "steps_per_product":  6,
+            "seed":              77,
+        },
+        "expected": {
+            "Avg utilisation":  "> 85%",
+            "Makespan":         "Long",
+            "Bottleneck risk":  "High",
+            "Scheduling style": "MILP-critical",
+        },
+    },
+    "Capacity-Constrained Scheduling": {
+        "icon":     "🟡",
+        "color":    "#f59e0b",
+        "subtitle": "Moderate demand, tight machine allocation",
+        "description": (
+            "A medium-sized product mix with moderate demand pressed against a limited "
+            "machine count. No single machine is overwhelmed, but the scheduler must "
+            "carefully interleave batches. Good for testing gap-elimination and compaction."
+        ),
+        "tags":    ["constrained", "medium", "interleaving"],
+        "params":  {
+            "num_products":      12,
+            "num_machines":       4,
+            "demand_min":      5_000,
+            "demand_max":     30_000,
+            "steps_per_product":  5,
+            "seed":             123,
+        },
+        "expected": {
+            "Avg utilisation":  "60–85%",
+            "Makespan":         "Medium",
+            "Bottleneck risk":  "Medium",
+            "Scheduling style": "Gap-elimination focus",
+        },
+    },
+    "Variable Processing Time": {
+        "icon":     "🔵",
+        "color":    "#60a5fa",
+        "subtitle": "Highly heterogeneous step durations",
+        "description": (
+            "Products with a very wide demand spread (500 → 50 000 units) and randomised "
+            "routing depths (3–8 steps). Exposes scheduling sensitivity to time variability "
+            "and produces interesting Gantt shapes — ideal for visual exploration."
+        ),
+        "tags":    ["variable", "mixed", "exploration"],
+        "params":  {
+            "num_products":      10,
+            "num_machines":       6,
+            "demand_min":        500,
+            "demand_max":     50_000,
+            "steps_per_product":  0,   # 0 = random 3–8 per product
+            "seed":             999,
+        },
+        "expected": {
+            "Avg utilisation":  "Varies",
+            "Makespan":         "Variable",
+            "Bottleneck risk":  "Unpredictable",
+            "Scheduling style": "Exploration",
+        },
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Machine Grammar
@@ -242,7 +353,6 @@ def _generate_machines(n: int, rng: random.Random) -> list[dict]:
     n_cutting  = max(1, round(n * 0.30))
     n_stations = max(1, n - n_molding - n_cutting)
 
-    # ── Cutting / crimping pair machines ────────────────────────────────────
     for _ in range(n_cutting):
         b1, b2 = rng.sample(_MACHINE_BRANDS, 2)
         m1 = f"{rng.choice(_MACHINE_MODEL_PREFIXES)}-{rng.choice(_MACHINE_MODEL_NUMBERS)}"
@@ -254,7 +364,6 @@ def _generate_machines(n: int, rng: random.Random) -> list[dict]:
         used_names.add(name)
         machines.append({"name": name, "available_hours_per_day": 24.0, "_role": "cutting"})
 
-    # ── Assembly stations ────────────────────────────────────────────────────
     ops = rng.sample(_STATION_OPERATIONS, min(n_stations, len(_STATION_OPERATIONS)))
     if len(ops) < n_stations:
         ops += rng.choices(_STATION_OPERATIONS, k=n_stations - len(ops))
@@ -265,7 +374,6 @@ def _generate_machines(n: int, rng: random.Random) -> list[dict]:
         used_names.add(name)
         machines.append({"name": name, "available_hours_per_day": 16.0, "_role": "assembly"})
 
-    # ── Overmolding / injection machines ────────────────────────────────────
     per_group = max(4, round(12 / max(n_molding, 1)))
     start_idx = 1
     for _ in range(n_molding):
@@ -280,8 +388,41 @@ def _generate_machines(n: int, rng: random.Random) -> list[dict]:
     return machines
 
 
-def _generate_products(n: int, rng: random.Random) -> list[dict]:
-    """Generate n products with realistic wire-harness descriptions."""
+def _scaled_demand_ranges(demand_range: tuple[int, int]) -> dict[str, tuple[int, int]]:
+    """
+    Split a (min, max) demand range into low / mid / high tier sub-ranges
+    using the same tier-weight proportions as _DEMAND_WEIGHTS [0.2, 0.5, 0.3].
+
+    This ensures that the tiered distribution respects the caller-supplied
+    demand_range rather than always using the hard-coded 80–4500 defaults.
+    """
+    d_min, d_max = demand_range
+    span = max(d_max - d_min, 3)
+
+    low_top = d_min + max(1, int(span * 0.20))
+    mid_top = d_min + max(2, int(span * 0.70))
+
+    return {
+        "low":  (d_min,    max(d_min + 1, low_top)),
+        "mid":  (low_top,  max(low_top + 1, mid_top)),
+        "high": (mid_top,  d_max),
+    }
+
+
+def _generate_products(
+    n: int,
+    rng: random.Random,
+    demand_range: tuple[int, int] | None = None,
+) -> list[dict]:
+    """Generate n products with realistic wire-harness descriptions.
+
+    When demand_range is provided it overrides the module-level _DEMAND_RANGES
+    so the generated demands are scaled to the caller's (min, max) bounds.
+    """
+    effective_ranges = (
+        _scaled_demand_ranges(demand_range) if demand_range is not None else _DEMAND_RANGES
+    )
+
     products: list[dict] = []
     used_descs: set = set()
 
@@ -310,7 +451,7 @@ def _generate_products(n: int, rng: random.Random) -> list[dict]:
         used_descs.add(description)
 
         tier   = rng.choices(["low", "mid", "high"], weights=_DEMAND_WEIGHTS)[0]
-        demand = rng.randint(*_DEMAND_RANGES[tier])
+        demand = rng.randint(*effective_ranges[tier])
         batch  = rng.choice(_BATCH_SIZES)
 
         products.append({
@@ -348,8 +489,12 @@ def _build_step(op_category: str, connector: str, machine_name: str,
     }
 
 
-def _generate_process_steps(products: list, machines: list,
-                             avg_steps: int, rng: random.Random) -> list[dict]:
+def _generate_process_steps(
+    products: list,
+    machines: list,
+    avg_steps: int | None,
+    rng: random.Random,
+) -> list[dict]:
     """
     Assign process steps following factory flow:
 
@@ -360,6 +505,9 @@ def _generate_process_steps(products: list, machines: list,
     5. Wrap / Tape  → assembly station [optional]
     6. Overmolding  → molding machine  (always last)
     +  Test         → assembly station [optional ~50%]
+
+    When avg_steps is None or 0, each product gets a random depth of 3–8 steps
+    (Variable Processing Time scenario).
     """
     cutting_m  = [m["name"] for m in machines if m.get("_role") == "cutting"]
     assembly_m = [m["name"] for m in machines if m.get("_role") == "assembly"]
@@ -369,6 +517,9 @@ def _generate_process_steps(products: list, machines: list,
     if not assembly_m: assembly_m = [machines[min(1, len(machines)-1)]["name"]]
     if not molding_m:  molding_m  = [machines[-1]["name"]]
 
+    # Variable depth mode: each product independently picks a target length
+    variable_depth = (avg_steps is None or avg_steps == 0)
+
     all_steps: list[dict] = []
 
     for product in products:
@@ -377,6 +528,9 @@ def _generate_process_steps(products: list, machines: list,
         category  = product["_wire_category"]
         steps: list[dict] = []
         step_num = 1
+
+        # Per-product target when using variable depth
+        target_base = rng.randint(3, 8) if variable_depth else avg_steps
 
         def add(op_cat, machine_pool, cycle_range, workers=0.5):
             nonlocal step_num
@@ -406,9 +560,8 @@ def _generate_process_steps(products: list, machines: list,
         if rng.random() < wrap_probs.get(category, 0.30):
             add("wrap_tape", assembly_m, (7.5, 13.0), workers=0.5)
 
-        # 6. Optional extra assembly step to hit avg_steps target
-        target = avg_steps + rng.randint(-1, 1)
-        if len(steps) < target - 1:
+        # 6. Optional extra assembly step to hit target depth
+        if len(steps) < target_base - 1:
             add("assembly", assembly_m, (8.0, 15.0), workers=1.0)
 
         # 7. Test step (50% chance)
@@ -427,23 +580,49 @@ def _generate_process_steps(products: list, machines: list,
 # Public API
 # ---------------------------------------------------------------------------
 
+def get_scenario_catalog() -> list[dict]:
+    """Return a JSON-serialisable list of scenario profile metadata.
+
+    Each item includes name, icon, color, subtitle, description, tags,
+    params, and expected outcomes — suitable for the /api/scenario-profiles/
+    endpoint.
+    """
+    result = []
+    for name, profile in SCENARIO_CATALOG.items():
+        result.append({
+            "name":        name,
+            "icon":        profile["icon"],
+            "color":       profile["color"],
+            "subtitle":    profile["subtitle"],
+            "description": profile["description"],
+            "tags":        profile["tags"],
+            "params":      profile["params"],
+            "expected":    profile["expected"],
+        })
+    return result
+
+
 def generate_synthetic_dataset(
     num_products: int = 10,
     num_machines: int | None = None,
-    steps_per_product: int = 5,
+    steps_per_product: int | None = 5,
     seed: int | None = None,
-    demand_range: tuple[int, int] | None = None,  # kept for API compatibility (unused — tiered demand used instead)
+    demand_range: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """
     Generate a complete synthetic production dataset.
 
     Parameters
     ----------
-    num_products       : int   Products to generate (default 10)
-    num_machines       : int   Machines to include  (default min(num_products+3, 15))
-    steps_per_product  : int   Average routing depth per product (default 5)
-    seed               : int   RNG seed; None → use current time (fresh each call)
-    demand_range       : tuple Ignored (kept for backward-compat); tiered demand used instead.
+    num_products       : int        Products to generate (default 10)
+    num_machines       : int|None   Machines to include  (default min(num_products+3, 15))
+    steps_per_product  : int|None   Average routing depth per product.
+                                    None or 0 → random 3–8 per product (variable depth).
+    seed               : int|None   RNG seed; None → use current time (fresh each call)
+    demand_range       : tuple|None (demand_min, demand_max) to override the default
+                                    tiered demand ranges (80–4500).  When provided,
+                                    the tiered ranges are scaled proportionally to fit
+                                    within the supplied bounds.
 
     Returns
     -------
@@ -462,17 +641,16 @@ def generate_synthetic_dataset(
         num_machines = min(num_products + 3, 15)
     num_machines = max(4, min(num_machines, 25))
 
-    # Generate internal representations
-    machines = _generate_machines(num_machines, rng)
-    products = _generate_products(num_products, rng)
-    raw_steps = _generate_process_steps(products, machines, steps_per_product, rng)
+    # Treat 0 as "random variable depth" (same as None)
+    effective_steps = steps_per_product if (steps_per_product and steps_per_product > 0) else None
 
-    # Strip internal fields
+    machines  = _generate_machines(num_machines, rng)
+    products  = _generate_products(num_products, rng, demand_range=demand_range)
+    raw_steps = _generate_process_steps(products, machines, effective_steps, rng)
+
     clean_machines = [{k: v for k, v in m.items() if not k.startswith("_")} for m in machines]
     clean_products = [{k: v for k, v in p.items() if not k.startswith("_")} for p in products]
 
-    # Convert step format to the canonical routing dict expected by
-    # insert_synthetic_dataset_into_db (same keys as process_routing_data output)
     routing = [
         {
             "item":    s["product_item"],
@@ -485,12 +663,17 @@ def generate_synthetic_dataset(
         for s in raw_steps
     ]
 
+    steps_label = (
+        effective_steps if effective_steps is not None else "random 3–8"
+    )
+
     metadata = {
         "dataset_type":        "synthetic",
         "num_products":        num_products,
         "num_machines":        num_machines,
-        "steps_per_product":   steps_per_product,
+        "steps_per_product":   steps_label,
         "seed":                seed,
+        "demand_range":        list(demand_range) if demand_range else None,
         "total_routing_steps": len(routing),
     }
 
@@ -502,18 +685,57 @@ def generate_synthetic_dataset(
     }
 
 
+def generate_scenario_dataset(
+    scenario_name: str,
+    seed_override: int | None = None,
+) -> dict[str, Any]:
+    """
+    Generate a dataset for a named scenario profile.
+
+    Parameters
+    ----------
+    scenario_name  : str  Key from SCENARIO_CATALOG
+    seed_override  : int  Override the profile's default seed (optional)
+
+    Returns
+    -------
+    Same dict as generate_synthetic_dataset(), with metadata["scenario"] set.
+    """
+    if scenario_name not in SCENARIO_CATALOG:
+        valid = list(SCENARIO_CATALOG.keys())
+        raise ValueError(
+            f"Unknown scenario {scenario_name!r}. Valid profiles: {valid}"
+        )
+
+    profile = SCENARIO_CATALOG[scenario_name]
+    p       = profile["params"]
+
+    seed   = seed_override if seed_override is not None else p["seed"]
+    steps  = p["steps_per_product"]
+
+    dataset = generate_synthetic_dataset(
+        num_products      = p["num_products"],
+        num_machines      = p["num_machines"],
+        steps_per_product = steps if steps > 0 else None,
+        seed              = seed,
+        demand_range      = (p["demand_min"], p["demand_max"]),
+    )
+    dataset["metadata"]["scenario"] = scenario_name
+    return dataset
+
+
 def insert_synthetic_dataset_into_db(dataset: dict, clear_existing: bool = True) -> dict:
     """
     Persist a synthetic dataset into the Django ORM models.
 
     Parameters
     ----------
-    dataset        : dict  output of generate_synthetic_dataset()
+    dataset        : dict  output of generate_synthetic_dataset() or generate_scenario_dataset()
     clear_existing : bool  wipe existing data before inserting (default True)
 
     Returns
     -------
-    dict with counts: products_created, machines_created, process_steps_created
+    dict with counts: products_created, machines_created, process_steps_created, metadata
     """
     from api.models import Product, Machine, ProcessStep, ProductionSchedule  # noqa
 
@@ -523,16 +745,14 @@ def insert_synthetic_dataset_into_db(dataset: dict, clear_existing: bool = True)
         Product.objects.all().delete()
         Machine.objects.all().delete()
 
-    # ── Create Machine records ───────────────────────────────────────────────
     machine_objs: dict[str, Machine] = {}
     for m in dataset["machines"]:
         obj = Machine.objects.create(
-            name                  = m["name"],
+            name                    = m["name"],
             available_hours_per_day = m["available_hours_per_day"],
         )
         machine_objs[m["name"]] = obj
 
-    # ── Create Product records ───────────────────────────────────────────────
     product_objs: dict[int, Product] = {}
     for p in dataset["products"]:
         obj = Product.objects.create(
@@ -547,7 +767,6 @@ def insert_synthetic_dataset_into_db(dataset: dict, clear_existing: bool = True)
         )
         product_objs[p["item"]] = obj
 
-    # ── Create ProcessStep records ───────────────────────────────────────────
     steps_created = 0
     for s in dataset["routing"]:
         product = product_objs.get(s["item"])

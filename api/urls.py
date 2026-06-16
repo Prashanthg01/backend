@@ -65,8 +65,9 @@ from .views import (
     schedule_comparison,
     optimize_schedule_preview,
     optimize_schedule_save,
-    # ── NEW: synthetic data ──────────────────────────────────────
+    # ── Synthetic data ───────────────────────────────────────────
     initialize_synthetic_data,
+    get_scenario_profiles,
 )
 from .auth_views import login, logout, me
 
@@ -102,6 +103,7 @@ urlpatterns = [
     path('optimize-schedule-preview/', optimize_schedule_preview, name='optimize_schedule_preview'),
     path('optimize-schedule/',         optimize_schedule_save,    name='optimize_schedule_save'),
 
-    # ── NEW: Synthetic data initialization ───────────────────────────────────
+    # ── Synthetic data initialization & scenario profiles ────────────────────
     path('initialize-synthetic/', initialize_synthetic_data, name='initialize_synthetic'),
+    path('scenario-profiles/',    get_scenario_profiles,     name='scenario_profiles'),
 ]

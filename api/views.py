@@ -1549,6 +1549,42 @@ from rest_framework.response import Response
 from rest_framework import status
 
 
+# ===========================================================================
+# SCENARIO PROFILES
+# ===========================================================================
+
+@api_view(["GET"])
+def get_scenario_profiles(request):
+    """
+    GET /api/scenario-profiles/
+
+    Return the catalog of all synthetic scenario profiles.
+
+    Response
+    --------
+    {
+      "profiles": [
+        {
+          "name": "Low Demand / High Availability",
+          "icon": "🟢",
+          "color": "#22c55e",
+          "subtitle": "...",
+          "description": "...",
+          "tags": ["baseline", "slack", "easy"],
+          "params": { "num_products": 5, "num_machines": 8, ... },
+          "expected": { "Avg utilisation": "< 40%", ... }
+        },
+        ...
+      ]
+    }
+    """
+    try:
+        from .utils_folder.synthetic_generator import get_scenario_catalog
+        return Response({"profiles": get_scenario_catalog()}, status=status.HTTP_200_OK)
+    except Exception as exc:
+        return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_synthetic_params(request_obj, is_post: bool = True) -> dict:
@@ -1595,6 +1631,10 @@ def _parse_synthetic_params(request_obj, is_post: bool = True) -> dict:
     demand_min = max(1, _int("demand_min", 500))
     demand_max = max(demand_min + 1, _int("demand_max", 50_000))
 
+    # Named scenario profile (optional) — when present, its params are used as
+    # defaults and the caller's explicit params override them field by field.
+    scenario_profile = src.get("scenario_profile") or None
+
     return {
         "num_products":      num_products,
         "num_machines":      num_machines,
@@ -1603,6 +1643,7 @@ def _parse_synthetic_params(request_obj, is_post: bool = True) -> dict:
         "demand_range":      (demand_min, demand_max),
         "clear_existing":    _bool("clear_existing", True),
         "async_mode":        _bool("async_mode", True),
+        "scenario_profile":  scenario_profile,
     }
 
 
@@ -1653,24 +1694,41 @@ def initialize_synthetic_data(request):
     try:
         # ── STEP 1: Parse parameters ──────────────────────────────────────────
         params = _parse_synthetic_params(request, is_post=True)
-        async_mode     = params.pop("async_mode")
-        clear_existing = params.pop("clear_existing")
+        async_mode       = params.pop("async_mode")
+        clear_existing   = params.pop("clear_existing")
+        scenario_profile = params.pop("scenario_profile", None)
 
         # ── STEP 2: Generate dataset in memory ────────────────────────────────
         # This is fast (<1 s) regardless of num_products, so we always do it
         # synchronously even in async mode (task only handles DB writes).
         from .utils_folder.synthetic_generator import (  # noqa
             generate_synthetic_dataset,
+            generate_scenario_dataset,
             insert_synthetic_dataset_into_db,
+            SCENARIO_CATALOG,
         )
 
-        dataset = generate_synthetic_dataset(
-            num_products      = params["num_products"],
-            num_machines      = params["num_machines"],
-            steps_per_product = params["steps_per_product"],
-            seed              = params["seed"],
-            demand_range      = params["demand_range"],
-        )
+        if scenario_profile and scenario_profile in SCENARIO_CATALOG:
+            # Named-profile path: start from the profile's defaults, then
+            # apply any explicit overrides supplied in the request body.
+            profile_params = SCENARIO_CATALOG[scenario_profile]["params"]
+            dataset = generate_synthetic_dataset(
+                num_products      = params["num_products"]      or profile_params["num_products"],
+                num_machines      = params["num_machines"]      or profile_params["num_machines"],
+                steps_per_product = params["steps_per_product"] if params["steps_per_product"] is not None
+                                    else profile_params["steps_per_product"],
+                seed              = params["seed"],
+                demand_range      = params["demand_range"],
+            )
+            dataset["metadata"]["scenario"] = scenario_profile
+        else:
+            dataset = generate_synthetic_dataset(
+                num_products      = params["num_products"],
+                num_machines      = params["num_machines"],
+                steps_per_product = params["steps_per_product"],
+                seed              = params["seed"],
+                demand_range      = params["demand_range"],
+            )
 
         # ── STEP 3: Async path ────────────────────────────────────────────────
         if async_mode:
