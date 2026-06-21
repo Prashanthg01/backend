@@ -1586,12 +1586,24 @@ def _reoptimise_machine(
     # Disjunctive constraints: every pair of ops must be non-overlapping.
     # y_ij = 1  →  op i runs before op j
     # y_ij = 0  →  op j runs before op i
+    #
+    # Exception: if both ops belong to the same batch AND one has a lower
+    # step number, the order is fixed by job sequencing — no binary variable
+    # needed; we add a hard ordering constraint instead.
     M = ub_global
     for i in range(n):
         for j in range(i + 1, n):
-            y = LpVariable(f"y_{i}_{j}", cat=LpBinary)
-            prob += S[j] >= S[i] + durations[i] - M * (1 - y)
-            prob += S[i] >= S[j] + durations[j] - M * y
+            same_batch = ops[i]['batch_id'] == ops[j]['batch_id']
+            if same_batch:
+                # Job-step order on this machine must match step-number order
+                if ops[i]['step_number'] < ops[j]['step_number']:
+                    prob += S[j] >= S[i] + durations[i]   # i before j, hard
+                else:
+                    prob += S[i] >= S[j] + durations[j]   # j before i, hard
+            else:
+                y = LpVariable(f"y_{i}_{j}", cat=LpBinary)
+                prob += S[j] >= S[i] + durations[i] - M * (1 - y)
+                prob += S[i] >= S[j] + durations[j] - M * y
 
     # Use time-limited solver to prevent blocking on complex instances
     prob.solve(_SOLVER_TIMED)
