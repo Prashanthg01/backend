@@ -1,0 +1,1104 @@
+TABLE OF CONTENTS
+-----------------
+  1.  System Overview
+  2.  Synthetic Data Generation
+  3.  Job-Shop Scheduling — Complete Process
+  4.  Optimization Process — ILP / Batch Optimization
+  5.  Scheduling Approach — Type 1 vs Type 2
+  6.  Comparative Analysis
+  7.  Evaluation Metrics
+  8.  What Is NOT Implemented
+  9.  Tech Stack Summary
+
+================================================================================
+  1. SYSTEM OVERVIEW
+================================================================================
+
+  This system is a production planning tool for a wire-harness factory.
+  A "wire harness" is a bundle of wires / connectors used in cars and electronics.
+
+  The factory makes multiple products. Each product must go through several
+  manufacturing steps, each step on a specific machine. The system decides:
+
+    - How to split total yearly demand into manageable batches
+    - In what order to run each batch on each machine
+    - How to minimize total production time (makespan)
+
+  HIGH-LEVEL FLOW:
+  ================
+
+  [CSV Data / Synthetic Data]
+         |
+         v
+  [Load into Database]
+    (Products, Machines, Process Steps)
+         |
+         v
+  [Batch Size Optimization — ILP]
+    (How many units per batch?)
+         |
+         v
+  [Schedule Generation]
+    Type 1: Shift-Aware  OR  Type 2: ERT + Compaction + PuLP
+         |
+         v
+  [Persist Schedule to DB]
+         |
+         v
+  [KPI / Gap Analysis / Gantt Chart]
+
+
+  DATABASE MODELS (Django ORM):
+  ==============================
+
+  Product         — what is being made
+    Fields: item, sap_tn, sap_pl, dcc_type, description, demand_2024,
+            batch_size, num_batches
+
+  Machine         — where it is made
+    Fields: name, available_hours_per_day
+
+  ProcessStep     — which machine, in which order, how long
+    Fields: product (FK), step_number, machine (FK), step_name,
+            cycle_time_seconds, workers_required
+
+  ProductionSchedule — the final timetable
+    Fields: machine (FK), product (FK), process_step (FK),
+            batch_id, batch_num, batch_size,
+            start_time, end_time, duration_hours
+
+
+================================================================================
+  2. SYNTHETIC DATA GENERATION
+================================================================================
+
+  FILE: backend/api/utils_folder/synthetic_generator.py
+
+  PURPOSE:
+  --------
+  Instead of always using real factory CSV files, this module generates
+  realistic-looking fake data. It mimics the structure and naming of a real
+  wire-harness factory, making it possible to test the scheduler without
+  real data.
+
+  WHY SYNTHETIC DATA?
+  -------------------
+  Real factory data may be confidential, unavailable, or too small/large.
+  Synthetic data lets us:
+    - Test all scheduling scenarios (easy, hard, bottleneck, variable)
+    - Reproduce results with a fixed random seed
+    - Scale the dataset up or down for testing
+
+  TECH STACK:
+  -----------
+    Python built-in: random, string, re, time
+    Django ORM: for persisting into the database
+
+
+  2.1  WHAT IS GENERATED?
+  ========================
+
+  Three types of objects are generated:
+
+  a) MACHINES  (physical factory equipment)
+     Three roles are generated:
+
+     Role          | Proportion | Hours/Day | Example Name
+     ------------- | ---------- | --------- | ----------------------------
+     Cutting       |    30%     |    24     | "Vortex ZX-200 / Nexus TX-400"
+     Assembly Stn  |    40%     |    16     | "Terminal Insertion Station"
+     Molding       |    30%     |    24     | "Engel ST250 Machine 1-4"
+
+     Assembly stations work 16 h/day (they need human operators).
+     Cutting and molding machines run 24 h/day (automated).
+
+  b) PRODUCTS  (wire-harness types)
+     Each product has:
+       - A unique part code (e.g., "F3-7842", "AB12345")
+       - A wire configuration (e.g., "Twisted Pair", "4-Wire Jacket")
+       - A connector family (e.g., "DCC", "MQS", "JPT")
+       - Annual demand (how many units to make)
+       - Batch size and number of batches
+
+     Demand is split into 3 tiers with these weights:
+       Low  (20%): bottom 20% of the demand range
+       Mid  (50%): middle 50% of the demand range
+       High (30%): top 30% of the demand range
+
+     EXAMPLE PRODUCT:
+       description: "Twisted Pair 2xMQS Module 45F-328B"
+       sap_tn: "TN-583291"
+       demand_2024: 12,450 units
+       batch_size: 250 units/batch
+       num_batches: 50 batches
+
+  c) ROUTING / PROCESS STEPS
+     Each product follows a factory flow with these steps (in order):
+
+     Step            | Machine Type | Cycle Time  | Always?
+     --------------- | ------------ | ----------- | -------
+     Cut & Strip     | Cutting      | 5.5–9.5 sec | YES
+     Crimp           | Cutting      | 5.0–9.0 sec | YES
+     Tube/Grommet    | Assembly     | 9.0–20.0 sec| 65% (jacket/shielded)
+     Connector Assy  | Assembly     | 7.0–14.0 sec| YES
+     Wrap/Tape       | Assembly     | 7.5–13.0 sec| Depends on wire type
+     Test            | Assembly     | 4.0–8.0 sec | 50% chance
+     Overmolding     | Molding      | 13.0–22.0 sec| YES (always last)
+
+     "Cycle time" = seconds to process ONE unit on that machine.
+
+
+  2.2  SCENARIO PROFILES
+  =======================
+
+  There are 4 pre-configured scenarios. Each one sets different parameters
+  to test the scheduler under different factory conditions:
+
+  PROFILE                          | Products | Machines | Demand Range    | Expected
+  -------------------------------- | -------- | -------- | --------------- | -------------------
+  Low Demand / High Availability   |    5     |    8     | 100 – 2,000     | Utilisation < 40%
+  High Demand / Bottleneck         |   20     |    3     | 10,000 – 100,000| Utilisation > 85%
+  Capacity-Constrained Scheduling  |   12     |    4     | 5,000 – 30,000  | Utilisation 60–85%
+  Variable Processing Time         |   10     |    6     | 500 – 50,000    | Varies
+
+  HOW DEMAND RANGES ARE SPLIT INTO TIERS:
+  ----------------------------------------
+  The function _scaled_demand_ranges() converts (min, max) into 3 sub-ranges:
+
+    Given: demand_range = (min, max)
+    span     = max - min
+    low_top  = min + 20% of span
+    mid_top  = min + 70% of span
+
+    Low tier:  [min,     low_top]
+    Mid tier:  [low_top, mid_top]
+    High tier: [mid_top, max]
+
+  EXAMPLE with demand_range = (5000, 30000):
+    span    = 25,000
+    low_top = 5,000 + 5,000  = 10,000
+    mid_top = 5,000 + 17,500 = 22,500
+
+    Low:  5,000 – 10,000
+    Mid: 10,000 – 22,500
+    High: 22,500 – 30,000
+
+
+  2.3  FLOW — HOW THE GENERATOR WORKS
+  =====================================
+
+  generate_synthetic_dataset()
+          |
+          |--- _generate_machines(n)         → list of machine dicts
+          |--- _generate_products(n)         → list of product dicts
+          |--- _generate_process_steps()     → list of step dicts
+          |
+          |--- Returns:
+                 {
+                   "machines": [...],
+                   "products": [...],
+                   "routing":  [...],
+                   "metadata": {...}
+                 }
+
+  insert_synthetic_dataset_into_db()
+          |
+          |--- Deletes all existing data (if clear_existing=True)
+          |--- Creates Machine objects
+          |--- Creates Product objects
+          |--- Creates ProcessStep objects
+          |--- Returns: { products_created, machines_created, process_steps_created }
+
+
+================================================================================
+  3. JOB-SHOP SCHEDULING — COMPLETE PROCESS
+================================================================================
+
+  FILE: backend/api/utils.py → run_job_shop_scheduler()
+        backend/api/tasks.py → generate_schedule_task()
+
+  WHAT IS JOB-SHOP SCHEDULING?
+  -----------------------------
+  Imagine a factory with multiple machines and multiple products (jobs).
+  Each product must go through a series of steps, each on a specific machine.
+  The challenge:
+    - A machine can only do one thing at a time
+    - Step 2 of a product cannot start until Step 1 is done
+    - We want to finish everything as fast as possible
+
+  This is the "Job-Shop Scheduling Problem" — one of the hardest problems in
+  computer science (technically NP-hard, meaning no perfect fast algorithm exists).
+
+  OUR SOLUTION: A 3-PHASE PIPELINE
+  =================================
+
+  PHASE 1a — Greedy Dispatch (ERT)
+    → Quickly assign all operations to machines, respecting constraints.
+    → Fast but not perfect; may leave idle gaps.
+
+  PHASE 1b — Left-Shift Compaction (Gap Elimination)
+    → Slide operations earlier to close idle gaps.
+    → Runs after Phase 1a.
+
+  PHASE 2 — PuLP MILP (Local Re-optimization)
+    → Re-solve the hardest machines using a mathematical optimizer.
+    → Refines the schedule on bottleneck machines.
+
+  Full pipeline:
+
+  [Products + Process Steps from DB]
+            |
+            v
+  [Sort Products by Total Work (LPT order)]
+            |
+            v
+  [Expand into (product, batch, step) triples — job_ops list]
+            |
+            v
+  ┌─────────────────────────────────────────────────────────────┐
+  │  PHASE 1a: Greedy ERT Dispatcher                            │
+  │  • Each op gets an estimated start = max(machine free,      │
+  │    job predecessor done)                                     │
+  │  • Priority queue (min-heap) pops the op with lowest start  │
+  │  • Round-robin tie-breaking prevents one product monopolizing│
+  └─────────────────────────────────────────────────────────────┘
+            |
+            v
+  ┌─────────────────────────────────────────────────────────────┐
+  │  PHASE 1b: Left-Shift Compaction (up to 5 passes)           │
+  │  • Scan all ops by current start time                        │
+  │  • For each op: find earliest_start = max(machine gap,      │
+  │    predecessor end)                                          │
+  │  • Slide op earlier if gap found                             │
+  │  • Repeat until no ops move (converges in 2–3 passes)       │
+  └─────────────────────────────────────────────────────────────┘
+            |
+            v
+  ┌─────────────────────────────────────────────────────────────┐
+  │  PHASE 2: PuLP MILP on Top-K Bottleneck Machines            │
+  │  • Find K machines with most total processing hours          │
+  │  • For each: re-solve single-machine sequencing as MILP      │
+  │  • 45-second solver time limit per machine                   │
+  │  • Rebuild all timings in topological order after            │
+  └─────────────────────────────────────────────────────────────┘
+            |
+            v
+  [Second Left-Shift Compaction pass — closes gaps created by Phase 2]
+            |
+            v
+  [Schedule Validation — check for conflicts and precedence violations]
+            |
+            v
+  [Persist to ProductionSchedule table via bulk_create (chunks of 1000)]
+
+
+  3.1  PHASE 1a — ERT GREEDY DISPATCHER
+  ======================================
+
+  "ERT" = Earliest Release Time. This heuristic picks the operation that
+  can start soonest across all ready operations.
+
+  ALGORITHM (step by step):
+  ---------------------------
+  1. Sort products by total work hours DESCENDING (Longest Processing Time first).
+     → Heavy products start their upstream steps first, freeing downstream
+       machines for lighter products sooner.
+
+  2. Assign an interleave_rank to each job:
+       rank = (batch_number - 1) × num_products + product_rank
+
+     This ensures dispatch order is: P1b1, P2b1, P3b1, P1b2, P2b2, ...
+     → Prevents one product from monopolizing all machines before others start.
+
+  3. Push all "first steps" of every job into a min-heap at time 0.
+     Heap entry: (estimated_start, interleave_rank, job_id, step_idx, op)
+
+  4. Pop the heap (gets the operation that starts earliest):
+     actual_start = max(machine_free[machine], job_ready[job])
+     actual_end   = actual_start + duration
+
+  5. If actual_start > estimated_start (machine got busier since we pushed):
+     → Re-push with updated time (stale entry check).
+
+  6. Record the operation. Update:
+     machine_free[machine] = actual_end
+     job_ready[job]        = actual_end
+
+  7. Push the NEXT step of this job into the heap.
+
+  8. Repeat steps 4–7 until heap is empty.
+
+  WHY NOT JUST USE SHORTEST-PROCESSING-TIME (SPT)?
+  -------------------------------------------------
+  The original SPT approach processed all step-1 ops, then all step-2 ops.
+  This caused two visible Gantt gaps:
+    a) A machine would sit idle because the next waiting operation was not
+       ready (its predecessor on another machine wasn't done yet).
+    b) Round-by-round sorting gave light-short jobs priority even when they
+       weren't actually available yet.
+
+  ERT fixes this by looking globally at what CAN start soonest, not just
+  what is shortest within the current step.
+
+
+  3.2  PHASE 1b — LEFT-SHIFT COMPACTION
+  =======================================
+
+  After greedy dispatch, gaps appear. Example:
+
+  Machine A:  [Job1-Step1]   [gap]   [Job2-Step1]
+  Machine B:              [Job1-Step2]            [Job2-Step2]
+
+  The gap on Machine A is not because Machine A is busy — it's because
+  Job2's Step1 needed to wait for Job2's setup. But if Job2's Step1 can
+  start earlier, we can slide it left.
+
+  ALGORITHM (iterative left-shift):
+  -----------------------------------
+  For each pass (max 5 passes):
+    1. Sort all operations by current start time.
+    2. For each operation:
+       a. Compute: predecessor_end = when did step N-1 of THIS job finish?
+       b. Compute: earliest_machine_slot = first gap on this machine
+                   starting from predecessor_end that fits the duration.
+       c. If earliest_machine_slot < current_start − tolerance:
+          → Slide the operation to earliest_machine_slot.
+    3. If no operations moved this pass → stop early (converged).
+
+  FINDING THE EARLIEST MACHINE SLOT — _first_fit_gap_hrs():
+  -----------------------------------------------------------
+  Inputs: sorted list of (start, end) busy blocks on a machine,
+          minimum allowed start time, operation duration.
+
+  Walk the busy blocks:
+    - If block ends before our candidate → skip (we're already past it)
+    - If our op fits in the gap before this block → stop
+    - If our op would overlap this block → push candidate to block_end
+
+  EXAMPLE:
+    Machine timeline: busy at [0–2h], [3–5h]
+    Need: 1.5h slot starting from earliest = 1.0h
+
+    candidate = 1.0
+    Block [0–2h]: 1.0 + 1.5 = 2.5 > 2.0 → push candidate to 2.0
+    Block [3–5h]: 2.0 + 1.5 = 3.5 ≤ 3.0? No → push candidate to 3.0
+    Wait: 3.0 + 1.5 = 4.5 > 3.0 and 4.5 ≤ 5.0? Yes → return 3.0
+    Final: op placed at 3.0–4.5h
+
+
+  3.3  PHASE 2 — PuLP MILP ON BOTTLENECK MACHINES
+  ==================================================
+
+  After greedy + compaction, bottleneck machines still may have a suboptimal
+  sequence. Phase 2 re-solves the sequencing on the K most-loaded machines.
+
+  FOR EACH BOTTLENECK MACHINE — _reoptimise_machine():
+  ------------------------------------------------------
+  Decision variables:
+    S_i    (continuous) — start time of operation i (hours from epoch)
+    Cmax   (continuous) — total machine makespan = max(S_i + d_i)
+    y_ij   (binary)     — 1 if operation i runs BEFORE operation j
+
+  Objective:
+    MINIMIZE Cmax
+
+  Constraints:
+    1. Makespan definition:
+         Cmax ≥ S_i + d_i   for all i
+         (Cmax must be at least as large as every op's finish time)
+
+    2. Non-overlap (disjunctive):
+         If y_ij = 1 (i before j):   S_j ≥ S_i + d_i - M(1 - y_ij)
+         If y_ij = 0 (j before i):   S_i ≥ S_j + d_j - M × y_ij
+         where M = 1.5 × current_makespan (big-M constant)
+
+    3. Routing dependency (predecessor lower bound):
+         S_i ≥ predecessor_end_i
+         (Op i cannot start before its previous step on another machine finishes)
+
+    4. Same-batch ordering (hard constraint, no binary variable needed):
+         If ops i and j are from the same batch:
+           If step(i) < step(j):  S_j ≥ S_i + d_i   (i must precede j)
+
+  Number of binary variables = O(n²) where n = ops on that machine.
+  For machines with > 200 ops, MILP is skipped (too slow); ops are just
+  re-sorted by start time.
+
+  AFTER PHASE 2 — _rebuild_timings_after_phase2():
+  --------------------------------------------------
+  Phase 2 resequences one machine at a time. This may violate the timing
+  of successor steps on OTHER machines. So after all Phase 2 machines are
+  done, we rebuild ALL timings using a Kahn-style topological sort:
+
+  1. Lock in the machine ordering from Phase 2 start times.
+  2. For each op, two types of dependency:
+       - Job dependency:     step N must follow step N-1 of the same job
+       - Machine dependency: op at position k on a machine follows position k-1
+  3. Process ops in topological order (BFS via min-heap).
+  4. Each op starts at: max(job_predecessor_end, machine_predecessor_end)
+
+
+  3.4  SCHEDULE VALIDATION
+  =========================
+
+  After all phases complete, the schedule is validated for two invariants:
+
+  1. MACHINE CONFLICTS: No two operations on the same machine overlap in time.
+     If op_A ends at 5.0h and op_B starts at 4.5h → conflict (overlap 0.5h).
+
+  2. ROUTING VIOLATIONS: No operation starts before its predecessor ends.
+     If step 2 starts at 3.0h but step 1 ends at 3.5h → violation (0.5h early).
+
+  Tolerance: 1 second (1/3600 hours) — absorbs floating-point noise.
+
+  Output: { valid, machine_conflicts, routing_violations, total_errors, summary }
+
+
+================================================================================
+  4. OPTIMIZATION PROCESS — ILP / BATCH OPTIMIZATION
+================================================================================
+
+  FILE: backend/api/utils.py
+
+  WHAT IS BATCH OPTIMIZATION?
+  ----------------------------
+  For each product we have a yearly demand (e.g., 12,450 units).
+  We must decide:
+    - How many units to make per batch (batch_size)
+    - How many batches to run (num_batches)
+
+  Constraints:
+    batch_size × num_batches ≥ demand       (must cover full demand)
+    min_batch_size ≤ batch_size ≤ max_batch_size
+    num_batches ≤ max_num_batches
+
+  Objective:
+    MINIMIZE num_batches   (fewer batches = fewer machine setups = lower cost)
+
+  There are TWO batch optimization approaches:
+
+  APPROACH A — Single-Product ILP (optimize each product separately)
+  APPROACH B — Joint Multi-Product MILP (optimize all products together)
+
+
+  4.1  SINGLE-PRODUCT ILP — calculate_optimal_batch_size()
+  ==========================================================
+
+  TECH STACK: PuLP (Python LP/MIP library) + CBC (Coin-or Branch & Cut solver)
+
+  INPUT:
+    demand          = total units for this product
+    max_num_batches = max allowed batches (default 25)
+    min_batch_size  = min units/batch (default 50)
+    max_batch_size  = max units/batch (default 500)
+
+  STEP 1 — Compute ideal batch size (informational only):
+    ideal_batch_size = demand / max_num_batches
+    Example: demand=12,450, max_batches=25 → ideal=498
+
+  STEP 2 — Compute adaptive effective bounds via _adaptive_bounds():
+    The user's min/max preferences may be infeasible for extreme demands.
+
+    true_min = ceil(demand / max_num_batches)
+               (smallest possible batch when using max batches)
+    true_max = demand
+               (one giant batch)
+
+    eff_min = max(user_min, true_min)
+    eff_max = min(user_max, true_max)
+
+    If eff_min > eff_max → use true_min and true_max (ignore user preferences)
+
+    EXAMPLE for demand=319,908, max_batches=25, user_max=500:
+      true_min = ceil(319908/25) = 12,797
+      true_max = 319,908
+      eff_min  = max(50, 12797) = 12,797
+      eff_max  = min(500, 319908) → 500 < 12,797, so eff_min > eff_max
+      → Fall back: eff_min=12,797, eff_max=319,908
+
+  STEP 3 — Build the ILP model:
+    Variables:
+      B   (integer) — batch size          [eff_min, eff_max]
+      N   (integer) — number of batches   [1, max_num_batches]
+      y_n (binary)  — 1 if exactly n batches are chosen
+
+    Objective: Minimize N
+
+    Constraints:
+      Σ y_n = 1                          (exactly one choice)
+      N = Σ n × y_n                      (N equals the chosen n)
+      B ≥ ceil(demand/n) - M(1 - y_n)   (batch size covers demand/n, big-M)
+
+  STEP 4 — Solve with CBC solver.
+
+  STEP 5 — If infeasible, use fallback heuristic:
+    fallback_N = ceil(demand / eff_min)  (minimum batches that fit)
+    fallback_B = ceil(demand / fallback_N)
+
+  EXAMPLE (demand=2,400, min_batch=50, max_batch=500, max_batches=25):
+    true_min = ceil(2400/25) = 96
+    eff_min = max(50, 96) = 96
+    eff_max = min(500, 2400) = 500
+    Solver picks: N=5 (5 batches), B=480 (480 units/batch)
+    Check: 480 × 5 = 2,400 ✓
+
+
+  4.2  JOINT MULTI-PRODUCT MILP — optimize_product_batches_jointly()
+  ====================================================================
+
+  TECH STACK: PuLP + CBC solver (with time limit up to 180 seconds)
+
+  MOTIVATION:
+  -----------
+  Optimizing each product independently may overload one machine.
+  Joint optimization considers ALL products and ALL machines simultaneously
+  to balance the workload.
+
+  DECISION VARIABLES:
+    y_{p,n}  (binary)     — product p chooses n batches   [one per product]
+    C        (continuous) — worst-case machine load (hours) = makespan proxy
+
+  OBJECTIVE:
+    MINIMIZE C   (reduce the maximum machine load)
+
+  PRE-COMPUTATION — load_table[product][n][machine]:
+    For product p with demand D, choosing n batches:
+      batch_sz    = ceil(D / n)
+      total_units = batch_sz × n              (may slightly exceed D)
+      hours       = cycle_time_seconds × total_units / 3600
+
+    This is computed upfront for all (product, n) combinations.
+    It avoids nonlinear expressions inside the MILP.
+
+  CONSTRAINTS:
+    Per product p:
+      Σ_n y_{p,n} = 1                 (exactly one n chosen per product)
+      y_{p,n} = 0  if batch infeasible (prune infeasible options upfront)
+
+    Per machine m:
+      Σ_{p,n} load_{p,m,n} × y_{p,n} ≤ C   (all loads ≤ makespan proxy)
+
+  EXAMPLE (2 products, 2 machines):
+
+    Product A: demand=1,000, steps on Machine X (5s/unit), Machine Y (3s/unit)
+    Product B: demand=2,000, steps on Machine X (2s/unit), Machine Y (7s/unit)
+
+    If A=5 batches (B=200), B=10 batches (B=200):
+      Load on X: (5×200×5/3600) + (2×200×10/3600) = 1.39 + 1.11 = 2.50h
+      Load on Y: (3×200×5/3600) + (7×200×10/3600) = 0.83 + 3.89 = 4.72h
+      C = max(2.50, 4.72) = 4.72h  ← this is what we minimize
+
+  RESULT EXTRACTION:
+    For each product, find n where y_{p,n} > 0.5 (the chosen batch count).
+    new_batch_size  = ceil(demand / chosen_n)
+    new_num_batches = chosen_n
+
+  IMPROVEMENT METRIC:
+    improvement = (old_num_batches − new_num_batches) / old_num_batches × 100%
+    Positive = fewer batches = fewer setups = improvement.
+    (baseline: old = 12 batches, the default monthly split)
+
+
+  4.3  BUFFER ALLOCATION OPTIMIZATION — pulp_optimize_buffers()
+  ==============================================================
+
+  TECH STACK: PuLP + CBC solver (LP, not MIP — continuous variables only)
+
+  MOTIVATION:
+  -----------
+  Each machine needs a "buffer" (safety stock) to absorb variability.
+  Required buffer per machine:
+    required_buffer = throughput_per_hour × avg_operation_time × safety_factor
+
+  If total budget < sum(all required buffers), we must allocate intelligently.
+  High-utilization machines suffer more from buffer deficits → prioritize them.
+
+  DECISION VARIABLES:
+    alloc[m]  (continuous) — buffer hours allocated to machine m
+    slack[m]  (continuous) — unmet buffer = required[m] - alloc[m]
+
+  OBJECTIVE:
+    MINIMIZE Σ utilization[m] × slack[m]
+    (High-utilization machines are penalized more for unmet buffers)
+
+  CONSTRAINTS:
+    alloc[m] ≤ required[m]           (can't over-allocate)
+    slack[m] = required[m] - alloc[m] (slack definition)
+    Σ alloc[m] ≤ total_budget         (stay within budget)
+
+  FALLBACK (if solver fails):
+    Proportional allocation:
+      alloc[m] = total_budget × required[m] / sum(all required)
+
+
+================================================================================
+  5. SCHEDULING APPROACH — TYPE 1 vs TYPE 2
+================================================================================
+
+  When you click "Generate Schedule", you choose between two types.
+  They produce the same output format but use different algorithms.
+
+
+  5.1  TYPE 1 — SHIFT-AWARE DISCRETE-EVENT SCHEDULER
+  ====================================================
+
+  FILE: backend/api/utils.py → run_shift_aware_scheduler()
+
+  TECH STACK: Pure Python (no ILP solver needed)
+
+  WHAT IT DOES:
+  -------------
+  Schedules operations one by one in product order. Operations are snapped
+  into pre-defined shift windows. No operation can straddle a shift boundary.
+
+  SHIFT WINDOWS (default):
+    Morning:   06:00 – 14:00 (8 hours)
+    Afternoon: 14:00 – 22:00 (8 hours)
+    Night:     22:00 – 06:00 next day (modeled as 22:00 – 30:00, i.e., 8 hours)
+
+  PROTOCOLS GUARANTEED:
+    1. No machine overlap — machine_free_at is always advanced past op end
+    2. Step sequencing    — step N+1 waits for step N to finish
+    3. Shift boundaries   — _find_slot() only places ops within a window
+    4. Duration consistency — dur_hours = (end - start).total_seconds() / 3600
+
+  HOW _find_slot() WORKS:
+  -----------------------
+    candidate = max(machine_free_at, prev_step_end)
+    For each shift window (sw_start, sw_end):
+      actual_start = max(candidate, sw_start)
+      actual_end   = actual_start + duration
+      If actual_end ≤ sw_end → use this slot  ← fits inside shift!
+      Else → try next shift window
+
+  EXAMPLE:
+    Machine free at 13:30, prev step ends at 13:45, duration = 2 hours.
+    candidate = max(13:30, 13:45) = 13:45
+    Shift window 1: 06:00–14:00 → actual_start=13:45, end=15:45 > 14:00 ✗
+    Shift window 2: 14:00–22:00 → actual_start=14:00, end=16:00 ≤ 22:00 ✓
+    → Place op at 14:00–16:00
+
+  ADVANTAGES:
+    + Respects shift schedules (workers are only available during shifts)
+    + Simple and predictable
+    + Fast (no optimization needed)
+
+  DISADVANTAGES:
+    - Products processed in fixed order — no global optimization
+    - Can leave large gaps when the next operation doesn't fit in the current shift
+    - No load balancing across machines
+
+
+  5.2  TYPE 2 — ERT + COMPACTION + PuLP (default, recommended)
+  ==============================================================
+
+  FILE: backend/api/utils.py → run_job_shop_scheduler()
+
+  TECH STACK: Python heapq (Phase 1a), Pure Python (Phase 1b), PuLP+CBC (Phase 2)
+
+  This is the full 3-phase pipeline described in Section 3.
+  It does NOT enforce shift windows — operations can start/end at any time.
+
+  ADVANTAGES:
+    + Globally optimized — finds better sequences across all products
+    + Left-shift compaction eliminates idle gaps
+    + PuLP MILP refines bottleneck machines
+    + Shorter makespan than Type 1
+
+  DISADVANTAGES:
+    - Ignores shift boundaries (operations may span midnight or shift ends)
+    - Slower (especially Phase 2 MILP)
+    - Harder to explain to operators who follow shift schedules
+
+
+  5.3  COMPARISON TABLE
+  =====================
+
+  Feature                        | Type 1 (Shift-Aware) | Type 2 (ERT+PuLP)
+  -------------------------------|---------------------|------------------
+  Shift boundaries respected?    | YES                 | NO
+  Global load balancing?         | NO                  | YES (Phase 2)
+  Gap elimination?               | NO                  | YES (compaction)
+  Speed                          | Fast                | Slower
+  Makespan quality               | Moderate            | Better
+  Suitable for                   | Compliance/display  | Throughput max
+
+
+================================================================================
+  6. COMPARATIVE ANALYSIS
+================================================================================
+
+  This section describes what comparisons are done in the system.
+
+
+  6.1  BATCH OPTIMIZATION BEFORE vs AFTER
+  =========================================
+
+  IMPLEMENTED in: views.py → get_batch_optimization_preview()
+
+  The system compares:
+    Old values (from DB, typically 12 batches/year as initial default)
+    New values (from ILP optimizer)
+
+  For each product:
+    improvement = (old_num_batches − new_num_batches) / old_num_batches × 100%
+
+  Summary stats returned:
+    - total_products, total_demand, total_batches
+    - avg_batch_size, min_batch_size, max_batch_size, std_batch_size
+
+  EXAMPLE OUTPUT:
+    Product 7 — Demand: 12,450
+    Old: 12 batches × 1,038 units/batch
+    New:  5 batches × 2,490 units/batch
+    Improvement: 58.3% fewer setups
+
+  NOTE: "Improvement" here means fewer batches (setups). A positive % is good.
+  It does NOT measure machine time improvement — that comes from KPI comparison.
+
+
+  6.2  SCHEDULE COMPARISON ENDPOINT
+  ===================================
+
+  IMPLEMENTED in: views.py → schedule_comparison()
+
+  Returns a snapshot of the CURRENTLY SAVED schedule:
+    - makespan_hours, makespan_days
+    - total_operations, total_units
+    - machine_stats: [{ machine, used_hours, utilization%, operations }]
+    - avg_utilization
+
+  NOTE: There is NO side-by-side comparison between Type 1 vs Type 2 schedules
+  in the current implementation. Only the currently saved schedule is compared
+  against itself.
+
+
+  6.3  GAP ANALYSIS — BEFORE vs AFTER COMPACTION
+  ================================================
+
+  IMPLEMENTED in: utils.py → count_schedule_gaps() + left_shift_compaction()
+
+  During scheduling (logged to Celery task progress):
+    Phase 1a done  → count_schedule_gaps() → gaps_before
+    Phase 1b done  → count_schedule_gaps() → gaps_after
+    Report: "42 → 18 gaps, 12.4h → 4.1h idle"
+
+  After scheduling, gaps_after is stored in the schedule.
+
+
+  6.4  JOINT vs INDIVIDUAL BATCH OPTIMIZATION
+  =============================================
+
+  IMPLEMENTED in: views.py → get_joint_batch_preview() vs get_batch_optimization_preview()
+
+  Individual: each product optimized alone → may concentrate load on one machine
+  Joint:      all products optimized together → balances machine loads
+
+  The load_balance_score measures how evenly work is spread:
+    score = (1 − (max_load − min_load) / max_load) × 100
+
+  100 = perfectly balanced, 0 = all work on one machine
+
+
+================================================================================
+  7. EVALUATION METRICS
+================================================================================
+
+  7.1  MAKESPAN
+  ==============
+
+  IMPLEMENTED in:
+    - compute_schedule_kpis() in utils.py
+    - calculate_kpis() in utils.py (legacy, reads from DB)
+    - get_kpis() in views.py (API endpoint)
+
+  DEFINITION:
+  -----------
+  Makespan = total time from the start of the first operation to the
+             end of the last operation, measured in hours.
+
+  This is the most important metric — it tells you "how long does it
+  take to make all products from start to finish?"
+
+  FORMULA:
+    makespan_hours = max(end_hrs of all operations) − min(start_hrs of all ops)
+
+  For the DB-based version:
+    makespan_hours = (max(end_time) − min(start_time)).total_seconds() / 3600
+    makespan_days  = makespan_hours / 24
+
+  EXAMPLE:
+    First operation starts at 2026-01-01 06:00
+    Last operation ends  at 2026-01-08 14:00
+    makespan_hours = (8 days × 24h) + 8h = 200h
+    makespan_days  = 200 / 24 = 8.33 days
+
+  WHAT IS RETURNED:
+    { makespan_hours: 200.0, makespan_days: 8.33 }
+
+  HOW IT IS USED:
+    - All machine utilization percentages are relative to makespan
+    - Throughput rates are calculated as units / makespan
+    - The MILP in Phase 2 minimizes the individual machine makespan (Cmax)
+    - The Joint ILP minimizes the makespan proxy (max machine load in hours)
+
+
+  7.2  MACHINE UTILIZATION
+  =========================
+
+  IMPLEMENTED in:
+    - compute_schedule_kpis() in utils.py
+    - get_kpis() in views.py
+    - get_bottleneck_analysis() in views.py
+
+  DEFINITION:
+  -----------
+  Utilization = fraction of the total makespan window that a machine is
+                actually processing something (not idle).
+
+  FORMULA:
+    utilization[machine] = (total_busy_hours[machine] / makespan_hours) × 100%
+
+  Where:
+    total_busy_hours[machine] = sum of dur_hours for all ops on that machine
+
+  EXAMPLE:
+    Makespan = 200 hours
+    Machine "Crimping Station" has 120 hours of work across all batches.
+    Utilization = 120 / 200 × 100 = 60%
+
+  IDLE HOURS:
+    idle_hours = makespan_hours − used_hours
+    idle_pct   = idle_hours / makespan_hours × 100
+
+  BOTTLENECK:
+    The machine with the HIGHEST utilization is the bottleneck.
+    It limits overall throughput.
+
+  BOTTLENECK CLASSIFICATION (in get_bottleneck_analysis):
+    ≥ 85%  → CRITICAL BOTTLENECK   (add capacity or redistribute work)
+    ≥ 70%  → POTENTIAL BOTTLENECK  (monitor closely)
+    ≥ 50%  → WELL UTILIZED         (operating efficiently)
+    < 50%  → UNDERUTILIZED         (opportunity to consolidate)
+
+  WHAT IS RETURNED:
+    {
+      machine: "Terminal Insertion Station",
+      used_hours: 120.0,
+      utilization: 60.0,
+      idle_hours: 80.0,
+      idle_percentage: 40.0,
+      num_operations: 45,
+      products_processed: 3,
+      status: "WELL UTILIZED",
+      recommendation: "Operating efficiently"
+    }
+
+
+  7.3  COMPUTATIONAL TIME
+  ========================
+
+  PARTIALLY IMPLEMENTED.
+
+  WHAT IS TRACKED:
+  ----------------
+  Celery task progress is reported via update_state() at each phase:
+    5%  → Loading products
+    12% → Batch optimization
+    22% → Batch optimization complete
+    25% → Starting scheduler
+    55% → Greedy dispatch complete
+    60% → Starting gap elimination
+    70% → Gap elimination done
+    75% → PuLP optimization starting
+    83% → Post-Phase-2 gap elimination
+    87% → Post-Phase-2 compaction done
+    90% → Validating schedule
+    95% → Finalizing
+    100% → Complete
+
+  The progress can be polled via GET /api/task-status/{task_id}/.
+  The response includes a "progress" (0–100) and "status" string.
+
+  WHAT IS NOT DIRECTLY MEASURED:
+  --------------------------------
+  There is NO explicit stopwatch or timing dict returned in the API.
+  No per-phase wall-clock time (seconds) is stored in the database or returned
+  to the frontend. You can infer timing from Celery logs, but there is no
+  dedicated computation_time metric in the API response.
+
+  The PuLP solver uses time limits:
+    _SOLVER_TIMED = PULP_CBC_CMD(msg=0, timeLimit=45)
+    (for single-machine MILP in Phase 2 — hard cap of 45 seconds per machine)
+
+    Joint ILP (generate_schedule_task): timeLimit=90 seconds
+    Joint ILP (joint_optimize_task):    timeLimit=180 seconds
+
+
+  7.4  IDLE GAP REDUCTION
+  ========================
+
+  IMPLEMENTED in:
+    - left_shift_compaction() in utils.py
+    - count_schedule_gaps() in utils.py
+    - gap_analysis() endpoint in views.py
+
+  DEFINITION:
+  -----------
+  An idle gap is a period where a machine has NO operations — it is sitting
+  idle between two operations. Gaps are bad because they increase the makespan
+  without producing anything.
+
+  HOW GAPS ARE COUNTED — count_schedule_gaps():
+  -----------------------------------------------
+  For each machine:
+    Sort operations by start time.
+    For each pair of consecutive operations:
+      gap_hours = next_op.start_hrs − prev_op.end_hrs
+      If gap_hours × 3600 > 60 seconds → count it as a real gap
+
+  Returns:
+    total_gaps:       count of gaps across all machines
+    total_idle_hours: sum of gap durations across all machines
+    per_machine:      { machine_name: { gaps, idle_hours } }
+
+  IDLE GAP REDUCTION METRIC (in scheduling):
+  -------------------------------------------
+  During Phase 1b (left-shift compaction), we log:
+    gaps_before = count_schedule_gaps(schedule_after_phase_1a)
+    gaps_after  = count_schedule_gaps(schedule_after_phase_1b)
+
+    idle_hours_reduced = gaps_before.total_idle_hours − gaps_after.total_idle_hours
+    gaps_reduced       = gaps_before.total_gaps       − gaps_after.total_gaps
+
+  EXAMPLE:
+    After Phase 1a: 42 gaps, 12.4 idle hours
+    After Phase 1b:  18 gaps,  4.1 idle hours
+    Reduced: 24 gaps, 8.3 hours of idle time eliminated
+
+  GAP CAUSE CLASSIFICATION (in gap_analysis() endpoint):
+  -------------------------------------------------------
+  Each gap is labeled with a cause:
+
+    "interleave" — the op before and after the gap are from DIFFERENT products.
+                   Caused by batch interleaving (Product A finishes on Machine X,
+                   then Product B starts — but B wasn't ready when A finished).
+
+    "precedence" — same product, step > 1.
+                   Caused by the upstream step (on a different machine) not
+                   being done yet when the machine became free.
+
+    "spt"        — same product, first step.
+                   Caused by SPT/ordering artifacts (scheduling artefact).
+
+  WHAT THE API RETURNS (/api/gap-analysis/):
+  -------------------------------------------
+    {
+      total_gaps:        18,
+      total_idle_hours:  4.1,
+      worst_machine:     "Terminal Insertion Station",
+      clean_machines:    3,        ← machines with ZERO gaps
+      machine_stats:     [...],
+      gap_list:          [
+        {
+          machine:    "Terminal Insertion Station",
+          gap_start:  "2026-01-03T08:00:00",
+          gap_end:    "2026-01-03T09:30:00",
+          idle_hours: 1.5,
+          cause:      "precedence",
+          before_op:  "P3 Step 4",
+          after_op:   "P3 Step 5"
+        },
+        ...
+      ],
+      causes: { precedence: 10, interleave: 6, spt: 2 }
+    }
+
+
+================================================================================
+  8. WHAT IS NOT IMPLEMENTED
+================================================================================
+
+  The following features are commonly discussed in job-shop scheduling
+  literature but are NOT implemented in this system:
+
+  NOT IMPLEMENTED:
+  ----------------
+
+  1. COMPUTATIONAL TIME PER PHASE (metric)
+     No per-phase wall-clock timers are stored or returned in the API.
+     Only Celery progress % is tracked. You cannot query "how long did
+     Phase 2 MILP take?" from the API.
+
+  2. SIDE-BY-SIDE SCHEDULE COMPARISON (Type 1 vs Type 2)
+     There is no endpoint that runs BOTH schedules and compares their KPIs.
+     The schedule_comparison() endpoint shows only the saved schedule.
+
+  3. WORKER CONSTRAINTS
+     workers_required is stored in ProcessStep but is NOT enforced by the
+     scheduler. The scheduler does not check if enough workers are available
+     for a time slot.
+
+  4. MACHINE SETUP / CHANGEOVER TIMES
+     No sequence-dependent setup times (e.g., switching from Product A to B
+     on a machine requires 30 minutes of cleaning). All changeovers are zero.
+
+  5. DUE DATE / DEADLINE CONSTRAINTS
+     No per-product deadlines. The scheduler does not prioritize products
+     that must finish by a certain date.
+
+  6. REAL-TIME RE-SCHEDULING
+     If a machine breaks down or a step takes longer than expected, there is
+     no re-scheduling trigger. The schedule is a one-shot plan.
+
+  7. MULTI-RESOURCE CONSTRAINTS
+     Operators, tooling, raw materials — only machines are constrained.
+
+  8. WEIGHTED OBJECTIVE FUNCTION
+     The ILP minimizes num_batches or makespan proxy, not a weighted
+     combination of cost, makespan, and utilization.
+
+  9. PREEMPTION
+     Jobs cannot be interrupted and resumed. Each batch step runs to completion
+     on its machine once it starts.
+
+  10. CONTINUOUS IMPROVEMENT LOOP
+      There is no feedback loop where actual production times update the model
+      and the schedule self-corrects.
+
+
+================================================================================
+  9. TECH STACK SUMMARY
+================================================================================
+
+  COMPONENT                    | TECHNOLOGY USED
+  -----------------------------|--------------------------------------------------
+  API Framework                | Django REST Framework (DRF)
+  Database / ORM               | Django ORM (SQLite or PostgreSQL via django.db)
+  Background Tasks             | Celery + Redis (as broker)
+  ILP / MILP Solver            | PuLP + CBC (Coin-or Branch & Cut)
+  Schedule Algorithm           | Custom Python (ERT heapq dispatcher, compaction)
+  Synthetic Data Generation    | Python random, string, re (no external libraries)
+  Data Loading / CSV           | pandas, numpy
+  Validation                   | Pure Python (custom validate_schedule)
+  Phase 2 (Bottleneck Optim.)  | PuLP LpProblem, LpVariable, LpBinary, CBC solver
+  Buffer Allocation            | PuLP (LP, continuous variables only)
+  Scheduling Output            | Python list-of-dicts → Django ORM bulk_create
+  KPI Computation              | Pure Python + Django ORM aggregation (Sum, Max, Min)
+  Gap Analysis                 | Pure Python (iterating sorted operation lists)
+  Progress Reporting           | Celery update_state → AsyncResult polling
+  Task Queue                   | Celery shared_task (bind=True)
+
+  KEY PULP SOLVER SETTINGS:
+  --------------------------
+  _SOLVER       = PULP_CBC_CMD(msg=0)                 silent, no time limit
+  _SOLVER_TIMED = PULP_CBC_CMD(msg=0, timeLimit=45)   45s cap (Phase 2 MILP)
+  Joint ILP default time limit: 90–180 seconds (configurable)
+
+
+================================================================================
+  END OF DOCUMENTATION
+================================================================================
+  File: SYSTEM_DOCUMENTATION.txt
+  Generated: June 2026
+================================================================================

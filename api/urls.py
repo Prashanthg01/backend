@@ -68,6 +68,8 @@ from .views import (
     # ── Synthetic data ───────────────────────────────────────────
     initialize_synthetic_data,
     get_scenario_profiles,
+    # ── Comparative analysis ─────────────────────────────────────
+    compare_schedulers_view,
 )
 from .auth_views import login, logout, me
 
@@ -106,4 +108,7 @@ urlpatterns = [
     # ── Synthetic data initialization & scenario profiles ────────────────────
     path('initialize-synthetic/', initialize_synthetic_data, name='initialize_synthetic'),
     path('scenario-profiles/',    get_scenario_profiles,     name='scenario_profiles'),
+
+    # ── Comparative analysis ──────────────────────────────────────────────────
+    path('compare-schedulers/',   compare_schedulers_view,   name='compare_schedulers'),
 ]

@@ -1,0 +1,851 @@
+================================================================================
+  TYPE 1 vs TYPE 2 SCHEDULING — HOW THEY WORK, WHY THEY DIFFER
+  Date: 2026-07-01
+  Project: Production Scheduler — Django + Streamlit
+================================================================================
+
+This document explains the two scheduling approaches in plain English,
+walks through each algorithm step by step, shows exactly how the code
+implements each idea, gives a worked example, and explains why every
+design choice was made.
+
+Style guide: same as EVALUATION_METRICS_FORMULAS_2026-07-01.txt
+  — Plain English first, code section second, worked example third
+
+
+TABLE OF CONTENTS
+─────────────────
+  1.  Background — What Is a Scheduling Problem?
+  2.  TYPE 1  Shift-Aware Scheduler (Discrete-Event)
+        2a.  Plain English
+        2b.  Step-By-Step Algorithm
+        2c.  In Code
+        2d.  Worked Example (3 products, 3 machines)
+        2e.  Why We Built It This Way
+  3.  TYPE 2  Job-Shop Scheduler (ERT + Compaction + MILP)
+        3a.  Plain English
+        3b.  Step-By-Step Algorithm (3 phases)
+        3c.  In Code
+        3d.  Worked Example (same 3 products, 3 machines)
+        3e.  Why We Built It This Way
+  4.  Side-by-Side Difference Table
+  5.  When to Use Which Scheduler
+  6.  Glossary
+
+
+================================================================================
+  1.  BACKGROUND — WHAT IS A SCHEDULING PROBLEM?
+================================================================================
+
+You have a factory with several machines and several products.  Each product
+needs to go through a fixed sequence of steps (cut → assemble → inspect).
+Each step runs on a specific machine for a specific duration.  The problem:
+
+    In what order do we run everything so the total time is as short
+    as possible while still respecting all the rules?
+
+The academic name is the Job-Shop Scheduling Problem (JSSP).  It is NP-hard,
+meaning there is no known algorithm that finds the perfect answer for large
+instances in a reasonable time.  That is why we use smart heuristics (good
+answers fast) rather than brute-force search.
+
+Our system implements two separate approaches — "Type 1" and "Type 2" — each
+with different priorities, guarantees, and trade-offs.
+
+
+================================================================================
+  2.  TYPE 1 — SHIFT-AWARE SCHEDULER (Discrete-Event)
+================================================================================
+
+──────────────────────────────────────────────────────────────────────────────
+2a.  PLAIN ENGLISH
+──────────────────────────────────────────────────────────────────────────────
+
+Imagine a factory supervisor standing at a whiteboard at the start of the day.
+The supervisor goes through the product list one by one, top to bottom.  For
+each product, they work out when each step can start by answering two questions:
+
+    Q1: "Has the machine finished its previous job?"
+    Q2: "Has the previous step of THIS product's batch finished?"
+
+The answer is the later of those two times.  But there is a hard rule: every
+operation must fit ENTIRELY inside one of the pre-defined shift windows.
+No operation can start near the end of the morning shift and run over into the
+afternoon shift.  If it does not fit, the supervisor waits for the next shift.
+
+This makes the schedule easy to understand and guarantees that workers always
+see clean shift boundaries — no one gets called in at 2 a.m. to finish
+something that started at 11 p.m.
+
+The downside: the supervisor never looks ahead or moves things around.  Once
+a product is scheduled, it stays there.  If a lighter product could have been
+slotted into an idle gap, the scheduler does not notice.
+
+──────────────────────────────────────────────────────────────────────────────
+2b.  STEP-BY-STEP ALGORITHM
+──────────────────────────────────────────────────────────────────────────────
+
+PRE-WORK: Build the shift calendar
+    • Three shifts per day: Morning (06:00–14:00), Afternoon (14:00–22:00),
+      Night (22:00–06:00 next day written as hour 22–30)
+    • Generate 62 days' worth of shift windows as (start_datetime, end_datetime)
+      pairs.  Store them sorted chronologically.
+
+INITIALISE: machine_free_at[machine] = schedule_start_date  for every machine
+
+MAIN LOOP: for each product (in the order given, no sorting):
+    for each batch of that product (B001, B002, ...):
+        prev_step_end = schedule_start_date  ← sequencing anchor
+
+        for each step in that batch's routing (step 1, step 2, ...):
+            candidate = max(machine_free_at[machine], prev_step_end)
+            duration  = (cycle_time_seconds × batch_size) / 3600  [in hours]
+
+            for each shift window in chronological order:
+                skip if the window ends before candidate
+                actual_start = max(candidate, shift_window_start)
+                actual_end   = actual_start + duration
+                if actual_end <= shift_window_end:
+                    → SCHEDULE HERE.  Done.
+                else:
+                    → Does not fit. Try next window.
+
+            machine_free_at[machine] = actual_end
+            prev_step_end            = actual_end
+
+RESULT: a flat list of scheduled operations, one row per (batch, step) pair
+
+──────────────────────────────────────────────────────────────────────────────
+2c.  IN CODE  (backend/api/utils.py)
+──────────────────────────────────────────────────────────────────────────────
+
+FUNCTION: _get_shift_windows(base_dt, shifts, num_days)
+  Line ~2704
+  Builds the pre-computed shift calendar for 62 days.
+  Default shifts: [(6, 14), (14, 22), (22, 30)]
+  "22→30" means the night shift ends at 06:00 the next day (hour 30 = 06:00+1d)
+
+    base_day = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    for day_offset in range(num_days + 2):
+        for (sh, eh) in shifts:
+            s = base_day + timedelta(days=day_offset, hours=sh)
+            e = base_day + timedelta(days=day_offset, hours=eh)
+            if e > base_dt:
+                windows.append((s, e))
+
+  Why +2 days?  The night shift on day N actually ends on day N+1 at 06:00.
+  Adding 2 extra days ensures the last night shift is always captured.
+
+
+FUNCTION: _find_slot(machine_free_at, earliest_start, duration_h, shift_windows)
+  Line ~2736
+  Core logic that enforces shift boundaries.
+
+    candidate = max(machine_free_at, earliest_start)
+    duration  = timedelta(hours=duration_h)
+
+    for (sw_start, sw_end) in shift_windows:
+        if sw_end <= candidate:
+            continue                          ← this window is already past
+        actual_start = max(candidate, sw_start)
+        actual_end   = actual_start + duration
+        if actual_end <= sw_end:
+            return actual_start, actual_end   ← fits! return immediately.
+
+    return candidate, candidate + duration    ← fallback: no window found
+
+  The fallback at the bottom is a safety net only.  With 62 days of windows
+  it is essentially never reached under normal operating conditions.
+
+
+FUNCTION: run_shift_aware_scheduler(products, start_dt, ...)
+  Line ~2777
+  The outer loop that drives the algorithm.
+
+    shift_windows = _get_shift_windows(start_dt, shifts, num_days=60)
+    machine_free_at = {m: start_dt for m in all_machines}
+
+    for p in products_list:                     ← no sorting here
+        for batch_num in range(1, n_batches+1):
+            prev_step_end = start_dt
+            for step in steps:
+                start, end = _find_slot(
+                    machine_free_at[machine],
+                    prev_step_end,
+                    duration_h,
+                    shift_windows,
+                )
+                machine_free_at[machine] = end
+                prev_step_end            = end
+                schedule_rows.append({...})
+
+──────────────────────────────────────────────────────────────────────────────
+2d.  WORKED EXAMPLE
+──────────────────────────────────────────────────────────────────────────────
+
+Setup:
+  Schedule start: 2026-07-01 06:00 (exactly at Morning shift start)
+  Shift windows:  Morning 06:00–14:00, Afternoon 14:00–22:00, Night 22:00–06:00
+
+  Products (in given order):
+    P1: 1 batch, 1 step → M1, cycle 3600s, batch 10  → duration 10 hours
+    P2: 1 batch, 2 steps → M1 (4h), M2 (3h)
+    P3: 1 batch, 1 step → M2, 5 hours
+
+  Initial machine_free_at:  M1=06:00, M2=06:00
+
+────────────────────────────────
+
+SCHEDULING P1 (Step 1 → M1, 10h):
+
+  candidate = max(M1_free=06:00, prev_step_end=06:00) = 06:00
+  duration  = 10 hours
+
+  Check Morning window (06:00–14:00):
+    actual_start = max(06:00, 06:00) = 06:00
+    actual_end   = 06:00 + 10h      = 16:00
+    16:00 > 14:00 → does NOT fit in Morning shift
+
+  Check Afternoon window (14:00–22:00):
+    actual_start = max(06:00, 14:00) = 14:00
+    actual_end   = 14:00 + 10h       = 24:00 = next day 00:00
+    00:00 > 22:00 → does NOT fit in Afternoon shift
+
+  Check Night window (22:00–06:00+1day):
+    actual_start = max(06:00, 22:00) = 22:00
+    actual_end   = 22:00 + 10h       = 08:00 next day
+    08:00 > 06:00+1day = 30:00? No, 08:00 next day is 32h, window ends at 30h
+    → does NOT fit
+
+  Check Day 2 Morning (06:00+1day – 14:00+1day):
+    actual_start = max(06:00, 06:00+1day) = 06:00+1day
+    actual_end   = 06:00+1day + 10h       = 16:00+1day
+    16:00 > 14:00 → does NOT fit
+
+  Check Day 2 Afternoon (14:00+1day – 22:00+1day):
+    actual_start = max(06:00, 14:00+1day) = 14:00+1day
+    actual_end   = 14:00+1day + 10h       = 00:00+2days
+    00:00+2d > 22:00+1d → does NOT fit
+
+  Check Day 2 Night (22:00+1day – 06:00+2days):
+    actual_start = max(06:00, 22:00+1day) = 22:00+1day
+    actual_end   = 22:00+1day + 10h       = 08:00+2days
+    08:00+2d > 06:00+2d → does NOT fit
+
+  [Continuing... P1's 10h operation cannot fit in any 8h shift window]
+  → This operation is too large for a single shift.  Falls back to unconstrained.
+
+  NOTE FOR THIS EXAMPLE: Let us use a realistic 4h operation instead.
+
+────────────────────────────────
+REVISED EXAMPLE (realistic durations):
+
+  P1: 1 batch, 1 step → M1, 4 hours
+  P2: 1 batch, 2 steps → M1 (3h), M2 (2h)
+  P3: 1 batch, 1 step → M2, 5 hours
+
+SCHEDULE P1, Batch B001, Step 1 → M1, 4h:
+  candidate    = max(M1=06:00, prev=06:00) = 06:00
+  Morning window (06:00–14:00):
+    actual_start = 06:00
+    actual_end   = 10:00
+    10:00 ≤ 14:00 → FIT
+  Result: M1 runs 06:00–10:00
+  machine_free_at[M1] = 10:00,  prev_step_end = 10:00
+
+SCHEDULE P2, Batch B001, Step 1 → M1, 3h:
+  candidate    = max(M1=10:00, prev=06:00) = 10:00
+  Morning window (06:00–14:00):
+    actual_start = max(10:00, 06:00) = 10:00
+    actual_end   = 13:00
+    13:00 ≤ 14:00 → FIT
+  Result: M1 runs 10:00–13:00
+  machine_free_at[M1] = 13:00,  prev_step_end = 13:00
+
+SCHEDULE P2, Batch B001, Step 2 → M2, 2h:
+  candidate    = max(M2=06:00, prev=13:00) = 13:00
+  Morning window (06:00–14:00):
+    actual_start = max(13:00, 06:00) = 13:00
+    actual_end   = 15:00
+    15:00 > 14:00 → does NOT fit
+  Afternoon window (14:00–22:00):
+    actual_start = max(13:00, 14:00) = 14:00
+    actual_end   = 16:00
+    16:00 ≤ 22:00 → FIT
+  Result: M2 runs 14:00–16:00   ← NOTE: gap 06:00–14:00 on M2 was unused
+  machine_free_at[M2] = 16:00,  prev_step_end = 16:00
+
+SCHEDULE P3, Batch B001, Step 1 → M2, 5h:
+  candidate    = max(M2=16:00, prev=06:00) = 16:00
+  Afternoon window (14:00–22:00):
+    actual_start = max(16:00, 14:00) = 16:00
+    actual_end   = 21:00
+    21:00 ≤ 22:00 → FIT
+  Result: M2 runs 16:00–21:00
+  machine_free_at[M2] = 21:00
+
+FINAL TYPE 1 SCHEDULE:
+  ┌────────┬──────┬───────────────┬────────────────┐
+  │  Job   │ Step │    Machine    │      Time      │
+  ├────────┼──────┼───────────────┼────────────────┤
+  │  P1B1  │  S1  │      M1       │  06:00 – 10:00 │
+  │  P2B1  │  S1  │      M1       │  10:00 – 13:00 │
+  │  P2B1  │  S2  │      M2       │  14:00 – 16:00 │
+  │  P3B1  │  S1  │      M2       │  16:00 – 21:00 │
+  └────────┴──────┴───────────────┴────────────────┘
+
+  Makespan = 21:00 − 06:00 = 15 hours
+  M1 idle: 0h (ran continuously 06:00–13:00)
+  M2 idle: 8h (06:00–14:00 gap, then ran 14:00–21:00)
+  Note: P2B1_S2 had to wait for shift change even though M2 was free at 06:00.
+
+──────────────────────────────────────────────────────────────────────────────
+2e.  WHY WE BUILT IT THIS WAY
+──────────────────────────────────────────────────────────────────────────────
+
+WHY shift windows?
+  Real factories have crew shifts.  An operation cannot start at 13:45 if it
+  takes 2 hours and the afternoon crew arrives at 14:00.  The outgoing crew
+  cannot hand off a half-finished part.  Shift boundaries are a hard
+  operational constraint in many manufacturing environments.
+
+WHY no sorting?
+  Type 1 is meant to be a "simple, predictable, rule-following" baseline.
+  The order of products in the DB is typically the order the planner expects.
+  Sorting would make the output harder to reconcile with manual plans.
+
+WHY no compaction or optimisation?
+  Simplicity is the feature.  Operations planners should be able to trace
+  every decision: "P2's step 2 starts at 14:00 because the Morning shift
+  ends at 14:00 and the operation takes 2h."  No black-box re-ordering.
+
+WHY fallback to unconstrained if no window fits?
+  Better to produce an imperfect but complete schedule than to crash with
+  a RuntimeError.  The validation step reports these violations explicitly.
+
+
+================================================================================
+  3.  TYPE 2 — JOB-SHOP SCHEDULER (ERT + COMPACTION + MILP)
+================================================================================
+
+──────────────────────────────────────────────────────────────────────────────
+3a.  PLAIN ENGLISH
+──────────────────────────────────────────────────────────────────────────────
+
+Imagine replacing the supervisor with a team of three specialists:
+
+SPECIALIST 1 — The Dispatcher (ERT Greedy):
+  Watches all machines simultaneously.  Every time any machine finishes a job,
+  the dispatcher asks: "What operation is ready to run right now, and on which
+  machine can it start the soonest?"  It always picks the operation with the
+  earliest possible start time across all ready work.  This is the Earliest
+  Release Time (ERT) heuristic.  It produces a pretty good schedule quickly —
+  like a very fast, globally-aware supervisor.
+
+SPECIALIST 2 — The Gap Closer (Left-Shift Compaction):
+  After the Dispatcher is done, there are still some idle gaps — times where a
+  machine sits empty even though some operation could theoretically run earlier.
+  The Gap Closer goes through every operation and asks: "Could this start
+  sooner?"  If yes, it slides it left.  Repeats this up to 5 times until no
+  more gaps can be closed.  Think of it as sliding blocks left on a Gantt chart.
+
+SPECIALIST 3 — The Optimizer (PuLP MILP):
+  The Dispatcher works for ALL machines.  The Optimizer focuses only on the
+  busiest machines — the bottlenecks.  For each bottleneck machine, it runs a
+  mathematical optimizer (a Mixed Integer Linear Program solved by the CBC
+  solver) to find the best possible order of operations on that machine.  After
+  MILP re-sequences the bottleneck machines, the Gap Closer runs one more time
+  to clean up any new gaps the MILP created.
+
+The three specialists work in sequence:
+  Dispatch → Close gaps → Optimize bottlenecks → Close gaps again → Validate
+
+──────────────────────────────────────────────────────────────────────────────
+3b.  STEP-BY-STEP ALGORITHM (3 Phases)
+──────────────────────────────────────────────────────────────────────────────
+
+PRE-WORK: Build routing dictionary (same as Type 1)
+  routing[product_pk] = ordered list of steps with machine + cycle time
+
+STEP 1: LPT Ordering (Longest Processing Time first)
+  Sort products by TOTAL work hours (all steps × all batches) DESCENDING.
+  The heaviest product goes first.
+
+  total_work_hrs(p) = Σ(cycle_sec_per_step) × batch_size × num_batches / 3600
+
+  Why? If the heaviest product's upstream steps are dispatched first, its
+  downstream machines (like the final sealing station) unlock earlier.  Lighter
+  products can then flow into those machines without waiting.
+
+STEP 2: Job Expansion
+  Convert each (product, batch) pair into a list of schedulable operations.
+  Each operation knows its job_id, machine, duration, and step_index.
+
+  job_id format:  "P1_B001", "P1_B002", "P2_B001", ...
+  dur_hours = (cycle_time_seconds × batch_size) / 3600
+
+PHASE 1a: Greedy ERT Dispatcher
+  Uses a priority queue (min-heap) sorted by (earliest_start, interleave_rank).
+
+  Initial state:
+    - machine_free[m] = 0.0 for all machines
+    - job_ready[j]    = 0.0 for all jobs (everyone is ready at t=0)
+    - Push all first-step operations onto the heap with est_start=0.0
+
+  Loop until heap is empty:
+    1. Pop the operation with the lowest est_start
+    2. actual_start = max(machine_free[machine], job_ready[job])
+    3. If actual_start > est_start (machine got busier since we pushed it):
+         Re-push with updated est_start (stale entry — skip this pop)
+    4. Otherwise: schedule the operation
+         end = actual_start + dur_hours
+         machine_free[machine] = end
+         job_ready[job]        = end
+    5. Push the NEXT step of this job with est_start = max(machine_free[next_machine], end)
+
+  Round-robin tie-breaking:
+    At t=0 all first steps have est_start=0.  Without tie-breaking, the job
+    with the alphabetically lowest ID would win every tie, monopolising all
+    shared machines.  We assign each job an interleave_rank:
+      rank = (batch_number − 1) × n_products + product_rank_in_LPT_order
+    This interleaves batches: P1b1, P2b1, P3b1, P1b2, P2b2, P3b2, ...
+
+PHASE 1b: Left-Shift Compaction (up to 5 passes)
+  Sort all operations by start time.
+  For each operation (sorted by current start):
+    new_start = max(machine_last_end[machine], job_step_predecessor_end[job])
+    if new_start < current start_hrs:
+        slide left (update start_hrs, end_hrs, start_dt, end_dt)
+  Repeat until no operations moved or 5 passes reached.
+
+PHASE 2: PuLP MILP on Bottleneck Machines
+  Identify the K machines with the highest total processing hours.
+  For each bottleneck machine (skip if > 200 operations):
+    Build a single-machine MILP:
+      Variables: x[i] = start time for operation i
+                 y[i][j] = 1 if operation i runs before j (binary)
+      Constraints:
+        - x[i] ≥ predecessor_end (job sequencing)
+        - x[i] ≥ 0
+        - If y[i][j]=1: x[j] ≥ x[i] + dur[i]  (no overlap, i before j)
+        - If y[i][j]=0: x[i] ≥ x[j] + dur[j]  (no overlap, j before i)
+        - y[i][j] + y[j][i] = 1  (total ordering on this machine)
+      Objective: minimise max(x[i] + dur[i])  i.e. minimise machine makespan
+    Solve with CBC solver.  Apply new start times to the schedule.
+
+  After all K machines are re-sequenced:
+    Rebuild all timings via forward-pass topological sort.
+    (MILP changed machine N's times; this may have displaced other machines'
+    timings.  The forward-pass recomputes everything consistently.)
+
+POST-PHASE-2 COMPACTION: Left-shift again (up to 5 more passes)
+  MILP sometimes creates new gaps on non-bottleneck machines.  A second
+  compaction round closes these residual gaps.
+
+STEP 6: Validation
+  Check for machine conflicts (overlap) and routing violations (step N starts
+  before step N-1 ends).  Log warnings if found.  Attach validity flag to
+  every row so the Gantt chart can highlight bad operations.
+
+──────────────────────────────────────────────────────────────────────────────
+3c.  IN CODE  (backend/api/utils.py)
+──────────────────────────────────────────────────────────────────────────────
+
+FUNCTION: run_job_shop_scheduler(products, start_dt, ...)
+  Line ~974
+  The outer orchestrator — runs all 3 phases in sequence.
+
+    products_ordered = sorted(products, key=_total_work_hrs, reverse=True)
+    # ↑ LPT ordering
+
+    job_ops = [...]  # one dict per (product, batch, step) triple
+
+    schedule = _greedy_dispatch(jobs, job_ops, start_dt)
+    # ↑ Phase 1a
+
+    schedule = left_shift_compaction(schedule, max_passes=5)
+    # ↑ Phase 1b
+
+    schedule = _local_pulp_optimise(schedule, job_ops, start_dt, k_machines)
+    # ↑ Phase 2
+
+    schedule = left_shift_compaction(schedule, max_passes=5)
+    # ↑ Phase 1b again (post-MILP cleanup)
+
+
+FUNCTION: _greedy_dispatch(jobs, job_ops, start_dt, ...)
+  Line ~1228
+  The ERT dispatcher with round-robin tie-breaking.
+
+    heap = []
+    for jid, steps in ops_by_job.items():
+        heapq.heappush(heap, (0.0, job_rank[jid], jid, 0, steps[0]))
+    # ↑ All first steps pushed at t=0, ranked for interleaving
+
+    while heap:
+        est, rank, jid, step_idx, op = heapq.heappop(heap)
+        earliest = max(machine_free[op['machine']], job_ready[jid])
+
+        if earliest > est + 1e-9:
+            heapq.heappush(heap, (earliest, rank, jid, step_idx, op))
+            continue   # stale entry — re-push with updated time
+
+        machine_free[op['machine']] = earliest + op['dur_hours']
+        job_ready[jid]              = earliest + op['dur_hours']
+        # ↑ Commit operation; advance both trackers
+
+        next_est = max(machine_free[next_op['machine']], end_hrs)
+        heapq.heappush(heap, (next_est, rank, jid, step_idx+1, next_op))
+        # ↑ Push next step with estimated earliest start
+
+
+FUNCTION: _local_pulp_optimise(schedule, job_ops, start_dt, k_machines)
+  Line ~1470
+  Selects top-K bottleneck machines and runs MILP on each.
+
+    machine_load = {m: Σ dur_hours for ops on m}
+    top_machines = sorted(machine_load, key=..., reverse=True)[:k_machines]
+    for machine in top_machines:
+        _reoptimise_machine(schedule, indices, machine, start_dt, predecessor_end_for)
+    _rebuild_timings_after_phase2(schedule, start_dt)
+    return schedule
+
+
+FUNCTION: _reoptimise_machine(schedule, indices, machine_name, ...)
+  Line ~1544
+  The actual single-machine MILP for one bottleneck machine.
+
+    n   = len(ops)
+    y   = LpVariable.dicts("y", [(i,j) for i<j], 0, 1, cat='Binary')
+    x   = LpVariable.dicts("x", range(n), 0, cat='Continuous')
+    C   = LpVariable("C", 0, cat='Continuous')  # makespan variable
+
+    for each op i:
+        prob += x[i] >= predecessor_end_for.get(op_i, 0.0)  # job sequencing
+        prob += C >= x[i] + dur[i]                           # makespan bound
+
+    for each pair (i, j):
+        prob += x[j] >= x[i] + dur[i] - BIG_M*(1-y[i,j])   # if i before j
+        prob += x[i] >= x[j] + dur[j] - BIG_M*y[i,j]       # if j before i
+
+    prob += lpSum(y[i,j] for i<j)  # minimise makespan via objective C
+
+
+FUNCTION: left_shift_compaction(schedule, max_passes)
+  (Defined separately in utils.py)
+  Slides every operation as early as possible given machine and job constraints.
+
+──────────────────────────────────────────────────────────────────────────────
+3d.  WORKED EXAMPLE (same 3 products, 3 machines as Type 1)
+──────────────────────────────────────────────────────────────────────────────
+
+Setup (same as Type 1 example):
+  Schedule start: t=0 (hours)
+  NO shift windows — Type 2 runs continuously 24/7.
+
+  Products (after LPT sort):
+    P1: M1 (4h)
+    P2: M1 (3h) → M2 (2h)   total = 5h × batch
+    P3: M2 (5h)              total = 5h × batch
+
+  LPT order: P2 and P3 are tied at 5h total; P1 is 4h.
+  Let's say the sort puts them:  P2, P3, P1
+
+  All first steps pushed onto heap at t=0:
+    P2_B001 Step1 → M1 (3h), rank=0   heap entry: (0.0, 0, P2_B001, 0, op)
+    P3_B001 Step1 → M2 (5h), rank=1   heap entry: (0.0, 1, P3_B001, 0, op)
+    P1_B001 Step1 → M1 (4h), rank=2   heap entry: (0.0, 2, P1_B001, 0, op)
+
+────────────────────────────────
+PHASE 1a DISPATCH:
+
+Pop (0.0, 0, P2_B001, Step1→M1):
+  actual_start = max(M1_free=0, job_ready[P2_B001]=0) = 0
+  end = 0 + 3 = 3h
+  M1_free = 3h,  P2_B001_ready = 3h
+  Scheduled: P2_B001 Step1: M1, 0h–3h
+
+  Next step of P2_B001 is Step2→M2 (2h)
+  next_est = max(M2_free=0, job_ready=3) = 3
+  Push (3.0, 0, P2_B001, Step2)
+
+Pop (0.0, 1, P3_B001, Step1→M2):
+  actual_start = max(M2_free=0, job_ready[P3_B001]=0) = 0
+  end = 0 + 5 = 5h
+  M2_free = 5h,  P3_B001_ready = 5h
+  Scheduled: P3_B001 Step1: M2, 0h–5h
+  (No next step for P3)
+
+Pop (0.0, 2, P1_B001, Step1→M1):
+  actual_start = max(M1_free=3, job_ready[P1_B001]=0) = 3
+  3 > est(0.0) → RE-PUSH as (3.0, 2, P1_B001, Step1)
+
+Pop (3.0, 0, P2_B001, Step2→M2):
+  actual_start = max(M2_free=5, job_ready[P2_B001]=3) = 5
+  5 > est(3.0) → RE-PUSH as (5.0, 0, P2_B001, Step2)
+
+Pop (3.0, 2, P1_B001, Step1→M1):
+  actual_start = max(M1_free=3, job_ready[P1_B001]=0) = 3
+  3 ≤ est(3.0) → SCHEDULE
+  end = 3 + 4 = 7h
+  M1_free = 7h,  P1_B001_ready = 7h
+  Scheduled: P1_B001 Step1: M1, 3h–7h
+
+Pop (5.0, 0, P2_B001, Step2→M2):
+  actual_start = max(M2_free=5, job_ready[P2_B001]=3) = 5
+  5 ≤ est(5.0) → SCHEDULE
+  end = 5 + 2 = 7h
+  M2_free = 7h,  P2_B001_ready = 7h
+  Scheduled: P2_B001 Step2: M2, 5h–7h
+
+PHASE 1a RESULT:
+  ┌──────────┬──────┬─────────┬──────────────┐
+  │   Job    │ Step │ Machine │     Time     │
+  ├──────────┼──────┼─────────┼──────────────┤
+  │ P2_B001  │  S1  │   M1    │  0h  –  3h  │
+  │ P3_B001  │  S1  │   M2    │  0h  –  5h  │
+  │ P1_B001  │  S1  │   M1    │  3h  –  7h  │
+  │ P2_B001  │  S2  │   M2    │  5h  –  7h  │
+  └──────────┴──────┴─────────┴──────────────┘
+  Makespan after Phase 1a = 7h
+
+PHASE 1b COMPACTION:
+  Sorted by start_hrs: P2S1(0), P3S1(0), P1S1(3), P2S2(5)
+  Check P2_B001_S1: max(M1_last_end=0, prev_job_end=0) = 0 ✓ no change
+  Check P3_B001_S1: max(M2_last_end=0, prev_job_end=0) = 0 ✓ no change
+  Check P1_B001_S1: max(M1_last_end=3, prev_job_end=0) = 3 ✓ no change
+  Check P2_B001_S2: max(M2_last_end=5, prev_job_end=3) = 5 ✓ no change
+
+  No moves possible.  Makespan stays 7h.
+
+PHASE 2 MILP (on M1 — highest load = 7h):
+  Ops on M1: P2S1(0-3h), P1S1(3-7h)
+  Current order: P2S1 → P1S1  (P2 before P1)
+  Try P1 before P2: P1S1(0-4h), P2S1(4-7h), P2S2=max(7,3)=7–9h
+    But P2S2 would need to start at 7h → makespan 9h — WORSE
+  Try P2 before P1: P2S1(0-3h), P1S1(3-7h), P2S2=max(5,3)=5–7h
+    Makespan on M1 = 7h — same as before
+
+  MILP keeps current order.  No improvement here.
+  (This example is already optimal after Phase 1a.)
+
+FINAL TYPE 2 SCHEDULE:
+  ┌──────────┬──────┬─────────┬──────────────┐
+  │   Job    │ Step │ Machine │     Time     │
+  ├──────────┼──────┼─────────┼──────────────┤
+  │ P2_B001  │  S1  │   M1    │  0h  –  3h  │
+  │ P3_B001  │  S1  │   M2    │  0h  –  5h  │
+  │ P1_B001  │  S1  │   M1    │  3h  –  7h  │
+  │ P2_B001  │  S2  │   M2    │  5h  –  7h  │
+  └──────────┴──────┴─────────┴──────────────┘
+
+  Makespan = 7h  (vs. Type 1: 15h)
+  M1 idle:  0h   (ran continuously 0h–7h)
+  M2 idle:  0h   (ran continuously 0h–7h)
+  Note: Type 2 had NO shift gap idle time.  The 8h gap on M2 in Type 1
+        was entirely caused by shift-window enforcement.
+
+──────────────────────────────────────────────────────────────────────────────
+3e.  WHY WE BUILT IT THIS WAY
+──────────────────────────────────────────────────────────────────────────────
+
+WHY ERT (Earliest Release Time) instead of simpler heuristics?
+  An earlier implementation used SPT (Shortest Processing Time) applied
+  round-by-round (all step-1 ops, then all step-2 ops).  This produced two
+  systematic gap patterns visible in the Gantt chart:
+    (a) ARBURG 375ST gap — short jobs were picked first, but they weren't
+        actually ready on ARBURG yet.  Longer-but-ready jobs were delayed.
+    (b) SKM Seal gap — one product monopolised shared upstream machines,
+        starving downstream shared machines for other products.
+  ERT's global view (always pick the operation that can start soonest across
+  ALL machines) eliminates both patterns.
+
+WHY round-robin tie-breaking?
+  At t=0 every job's first step has release time 0.0.  Without tie-breaking,
+  the Python heapq breaks ties on the job_id string.  The product with the
+  alphabetically first ID wins EVERY tie, monopolising machines before others
+  even get started.  Round-robin ensures batch interleaving:
+    P1b1, P2b1, P3b1, P1b2, P2b2, P3b2, ...
+  This dramatically reduces waiting time for products that share upstream
+  machines with the first product.
+
+WHY LPT (Longest Processing Time first)?
+  LPT is a classic greedy rule for parallel-machine scheduling.  The intuition:
+  the most work-intensive product occupies the most machine-time.  Scheduling
+  it first gives all other products the maximum possible window to fill idle
+  gaps on shared downstream machines.  LPT does not guarantee optimality but
+  has a known worst-case approximation ratio of 4/3 for makespan.
+
+WHY left-shift compaction?
+  The ERT dispatcher assigns each operation to a machine at the earliest
+  possible time given the CURRENT state of the heap.  Because operations are
+  dispatched one at a time, some idle gaps appear that the dispatcher could not
+  foresee.  Compaction is a post-processing pass that slides every operation
+  as early as possible — like tightening a Gantt chart from left to right.
+  It is fast (O(n²) in the worst case) and deterministic, making it safe to
+  run before and after MILP without side effects.
+
+WHY MILP only on the top-K bottleneck machines?
+  A full MILP for the entire job-shop problem is NP-hard and would take hours
+  (or fail to solve) for real-world instances.  Single-machine MILP, by
+  contrast, is O(n² log n) in practice for most manufacturing sizes.  Applying
+  it only to the K machines with the highest load targets the operations that
+  most strongly determine the overall makespan, giving near-optimal improvement
+  at tractable compute cost.
+
+WHY a second compaction pass after MILP?
+  MILP re-sequences one machine at a time.  After MILP updates machine M3's
+  operations, some successor operations on M5 (which depend on M3's output)
+  may now have a stale earlier start time.  The second compaction pass and the
+  _rebuild_timings_after_phase2 forward-pass ensure all timings are consistent
+  after MILP changes the bottleneck machines.
+
+WHY skip MILP for machines with more than 200 operations?
+  The MILP introduces n² binary variables for n operations on one machine.
+  At 200 operations that is 40,000 variables — still tractable.  At 500+ it
+  can take minutes.  The 200-operation cutoff keeps solve time under 30 seconds
+  in the worst realistic production scenario.
+
+
+================================================================================
+  4.  SIDE-BY-SIDE DIFFERENCE TABLE
+================================================================================
+
+  ┌──────────────────────────────┬──────────────────────────┬──────────────────────────────┐
+  │         Feature              │        TYPE 1            │           TYPE 2             │
+  ├──────────────────────────────┼──────────────────────────┼──────────────────────────────┤
+  │ Algorithm family             │ Discrete-event simulation│ Multi-phase heuristic + MILP │
+  │ Product ordering             │ As given (no sorting)    │ LPT (heaviest first)         │
+  │ Dispatching rule             │ Sequential per product   │ Global ERT min-heap          │
+  │ Shift constraints            │ Hard (must fit in window)│ None (24/7 continuous)       │
+  │ Gap closing                  │ None                     │ Left-shift compaction ×2     │
+  │ Mathematical optimization    │ None                     │ PuLP CBC MILP on bottlenecks │
+  │ Makespan (typical)           │ Higher (shift gaps)      │ Lower (continuous flow)      │
+  │ Machine utilization          │ Lower (shift idle time)  │ Higher (fewer idle periods)  │
+  │ Computational time           │ Very fast (~0.1s)        │ Slower (1–30s with MILP)     │
+  │ Deterministic output         │ Yes (no random element)  │ Yes (deterministic heapq)    │
+  │ Schedule explainability      │ Very easy to trace       │ Moderate (heap order, MILP)  │
+  │ Shift boundary guarantees    │ Hard guarantee           │ Not enforced                 │
+  │ Validation (post-schedule)   │ Yes (validate_schedule)  │ Yes (validate_schedule)      │
+  │ Precedence guarantees        │ Yes (prev_step_end gate) │ Yes (job_ready heapq + MILP) │
+  │ Machine overlap guarantee    │ Yes (machine_free_at)    │ Yes (machine_free heapq)     │
+  │ Batch interleaving           │ None (product-serial)    │ Round-robin tie-breaking     │
+  │ Config parameters            │ shifts, num_days         │ local_opt_machines,          │
+  │                              │                          │ enable_compaction            │
+  │ Good for                     │ Compliance, simplicity,  │ Throughput maximization,     │
+  │                              │ regulatory environments  │ what-if analysis             │
+  └──────────────────────────────┴──────────────────────────┴──────────────────────────────┘
+
+
+================================================================================
+  5.  WHEN TO USE WHICH SCHEDULER
+================================================================================
+
+USE TYPE 1 WHEN:
+  ✓ You need to present a schedule to an operations team that works in shifts
+  ✓ Regulatory or union rules require no cross-shift operations
+  ✓ You want a fast, auditable baseline that a human can verify manually
+  ✓ The planning horizon is long and precise throughput optimization is
+    less important than shift compliance
+  ✓ You are generating a "reference schedule" to compare against Type 2
+
+USE TYPE 2 WHEN:
+  ✓ Maximum throughput / minimum makespan is the primary goal
+  ✓ The factory can run flexibly without hard shift restrictions
+  ✓ You are doing what-if analysis (e.g., "what if we add a machine?")
+  ✓ You want to measure the true optimizable capacity before adding shift rules
+  ✓ You need to find which machines are the real bottlenecks (MILP identifies
+    and optimizes them explicitly)
+
+USE COMPARATIVE ANALYSIS (both together) WHEN:
+  ✓ You want to quantify the cost of shift constraints
+    (makespan difference = the price of shift compliance)
+  ✓ You want to present trade-offs to management
+    (Type 2 is X hours faster but does not enforce shifts)
+  ✓ You are tuning MILP parameters and want to see the improvement over
+    the greedy baseline before committing to the longer compute time
+
+
+================================================================================
+  6.  GLOSSARY
+================================================================================
+
+  ERT (Earliest Release Time)
+    Dispatching rule: always schedule the operation that can start the
+    soonest across all machines and all ready jobs.
+
+  LPT (Longest Processing Time first)
+    Product ordering heuristic: sort by total work hours descending.
+    Schedules the heaviest product's operations first.
+
+  JSSP (Job-Shop Scheduling Problem)
+    General scheduling problem where each job has a fixed sequence of
+    operations across specific machines.  NP-hard for 3+ machines.
+
+  MILP (Mixed Integer Linear Program)
+    Mathematical optimization model with both continuous (x = start time)
+    and binary (y = precedence) variables.  Solved by the CBC solver via
+    the PuLP Python library.
+
+  CBC (Coin-or Branch and Cut)
+    Open-source MILP solver bundled with PuLP.  Uses branch-and-bound
+    with linear programming relaxations at each node.
+
+  Left-Shift Compaction
+    Post-processing pass that slides each scheduled operation as early as
+    possible while respecting machine non-overlap and job precedence.
+    Equivalent to "packing blocks left" on a Gantt chart.
+
+  Makespan
+    Total schedule length = max(end_time) − min(start_time).  The primary
+    quality metric for comparing both schedulers.
+
+  Bottleneck Machine
+    The machine with the highest total processing load.  Its makespan
+    largely determines the whole schedule's makespan.
+
+  machine_free_at (Type 1) / machine_free (Type 2)
+    Dictionary tracking when each machine becomes available for the next
+    operation.  Both schedulers maintain this to prevent overlap.
+
+  Discrete-Event Simulation
+    Simulation style where time advances from event to event (e.g., each
+    "end of operation" is an event), rather than advancing in fixed steps.
+
+  Shift Window
+    A pre-defined time interval during which a machine can operate.
+    Type 1 enforces that every operation fits entirely within one window.
+
+  Precedence Constraint
+    Step N+1 of a batch cannot start before step N of the same batch ends.
+    Both schedulers enforce this via prev_step_end (Type 1) or job_ready
+    (Type 2).
+
+  Stale Entry (heapq)
+    In the ERT dispatcher, an operation pushed onto the heap with an
+    optimistic est_start may later find the machine became busier.  The
+    actual_start is recalculated on pop; if it differs, the entry is
+    discarded and re-pushed with the correct time.
+
+  BIG-M (MILP)
+    A large constant used in MILP disjunctive constraints to model
+    "if-then" relationships.  Set to the total schedule horizon so the
+    constraint is only active when the binary variable requires it.
+
+  Compaction Pass
+    One iteration of left-shift compaction over all operations.  Up to 5
+    passes are run; earlier passes shift early operations, which enables
+    later passes to shift operations that depend on them.
+
+  Interleave Rank
+    Tie-breaking score in the ERT dispatcher:
+      rank = (batch_number − 1) × n_products + product_rank
+    Ensures batches of all products are dispatched in round-robin fashion
+    when multiple operations share the same est_start.
+
+
+================================================================================
+  END OF DOCUMENT
+  File: TYPE1_TYPE2_SCHEDULING_DOC_2026-07-01.txt
+  Project: Production Scheduler — Django + Streamlit
+================================================================================

@@ -1137,6 +1137,23 @@ def run_job_shop_scheduler(
         _progress(75, f"PuLP optimisation on {local_opt_machines} bottleneck machines…")
         schedule = _local_pulp_optimise(schedule, job_ops, start_dt, local_opt_machines)
 
+    # ── STEP 5b: Post-Phase-2 compaction (second pass) ────────────────────────
+    # Phase 2 MILP re-sequences individual machines without touching the rest
+    # of the schedule. This can displace non-bottleneck operations and leave
+    # new idle gaps. A second compaction pass closes those residual gaps before
+    # final KPI calculation and validation.
+    # ─────────────────────────────────────────────────────────────────────────
+    if enable_compaction and schedule:
+        _progress(83, "Post-Phase-2 gap elimination…")
+        gaps_before = count_schedule_gaps(schedule)
+        schedule    = left_shift_compaction(schedule, max_passes=5)
+        gaps_after  = count_schedule_gaps(schedule)
+        _progress(87, (
+            f"Post-Phase-2 compaction done — "
+            f"{gaps_before['total_gaps']} → {gaps_after['total_gaps']} gaps, "
+            f"{gaps_before['total_idle_hours']:.1f}h → {gaps_after['total_idle_hours']:.1f}h idle"
+        ))
+
     # ── STEP 6: Post-schedule validation ──────────────────────────────────────
     # Verify that the final schedule has no machine conflicts and respects all
     # routing dependencies.  After the Phase 2 fix (predecessor lower bounds)
@@ -1674,6 +1691,179 @@ def compute_schedule_kpis(schedule_rows, makespan_hours):
         'utilisation':        utilisation,
         'bottleneck_machine': bottleneck,
         'bottleneck_util':    utilisation.get(bottleneck, 0) if bottleneck else 0,
+    }
+
+
+# ===========================================================================
+# 4b.  COMPARATIVE ANALYSIS  (Type 1 vs Type 2)
+# ===========================================================================
+# Runs both schedulers on the SAME product set and start date, then
+# computes the four evaluation metrics for each:
+#   1. Makespan           – total schedule duration
+#   2. Machine Utilization – per-machine + average utilisation %
+#   3. Computational Time  – wall-clock seconds for each scheduler
+#   4. Idle Gap Reduction  – count and total hours of machine idle gaps
+#
+# Nothing is persisted to the database — this is a pure in-memory analysis.
+
+def compare_schedulers(
+    products,
+    start_dt: datetime,
+    local_opt_machines: int = 5,
+    enable_compaction: bool = True,
+    batch_override: dict | None = None,
+    progress_callback=None,
+) -> dict:
+    """
+    Run Type 1 (Shift-Aware) and Type 2 (ERT + MILP) on the same product set
+    and return a side-by-side comparison across all four evaluation metrics.
+
+    Parameters
+    ----------
+    products            : iterable of Product ORM objects (same set for both)
+    start_dt            : datetime  schedule anchor
+    local_opt_machines  : int       Phase 2 MILP machines for Type 2 (default 5)
+    enable_compaction   : bool      left-shift compaction for Type 2 (default True)
+    batch_override      : dict|None { product_pk: (batch_size, num_batches) }
+    progress_callback   : callable  f(pct, msg) — forwarded to schedulers
+
+    Returns
+    -------
+    dict with keys: "type1", "type2", "delta", "metadata"
+    """
+    import time
+
+    products = list(products)   # materialise once so both schedulers get identical data
+
+    def _pct(lo, hi, msg):
+        if progress_callback:
+            progress_callback(lo + int((hi - lo) * 0.5), msg)
+
+    # ── TYPE 1: Shift-Aware ───────────────────────────────────────────────────
+    _pct(5, 45, "Running Type 1 (Shift-Aware) scheduler…")
+    t0_1 = time.perf_counter()
+    rows1 = run_shift_aware_scheduler(
+        products,
+        start_dt,
+        batch_override  = batch_override,
+        progress_callback = None,
+    )
+    comp_time1 = round(time.perf_counter() - t0_1, 3)
+
+    # ── TYPE 2: ERT + MILP ───────────────────────────────────────────────────
+    _pct(50, 90, "Running Type 2 (ERT + MILP) scheduler…")
+    t0_2 = time.perf_counter()
+    rows2 = run_job_shop_scheduler(
+        products,
+        start_dt,
+        local_opt_machines  = local_opt_machines,
+        enable_compaction   = enable_compaction,
+        batch_override      = batch_override,
+        progress_callback   = None,
+    )
+    comp_time2 = round(time.perf_counter() - t0_2, 3)
+
+    # ── KPIs & gaps for each result ───────────────────────────────────────────
+    def _metrics(rows, comp_time, label):
+        if not rows:
+            return {
+                "scheduler": label,
+                "computation_time_seconds": comp_time,
+                "makespan_hours": 0,
+                "makespan_days": 0,
+                "total_operations": 0,
+                "machines_used": 0,
+                "avg_utilization_pct": 0,
+                "bottleneck_machine": None,
+                "bottleneck_util_pct": 0,
+                "total_gaps": 0,
+                "total_idle_hours": 0,
+                "machine_utilization": {},
+                "per_machine_gaps": {},
+            }
+
+        start_h    = min(r["start_hrs"] for r in rows)
+        end_h      = max(r["end_hrs"]   for r in rows)
+        makespan_h = end_h - start_h
+
+        kpis = compute_schedule_kpis(rows, makespan_h)
+        gaps = count_schedule_gaps(rows)
+
+        util_map = kpis.get("utilisation", {})
+        avg_util = round(sum(util_map.values()) / len(util_map), 2) if util_map else 0
+
+        return {
+            "scheduler":                label,
+            "computation_time_seconds": comp_time,
+            "makespan_hours":           kpis.get("makespan_hours", 0),
+            "makespan_days":            kpis.get("makespan_days",  0),
+            "total_operations":         kpis.get("total_operations", 0),
+            "machines_used":            kpis.get("machines_used", 0),
+            "avg_utilization_pct":      avg_util,
+            "bottleneck_machine":       kpis.get("bottleneck_machine"),
+            "bottleneck_util_pct":      kpis.get("bottleneck_util", 0),
+            "total_gaps":               gaps.get("total_gaps", 0),
+            "total_idle_hours":         gaps.get("total_idle_hours", 0),
+            "machine_utilization":      util_map,
+            "per_machine_gaps":         gaps.get("per_machine", {}),
+        }
+
+    t1 = _metrics(rows1, comp_time1, "Shift-Aware (Type 1)")
+    t2 = _metrics(rows2, comp_time2, "ERT + MILP (Type 2)")
+
+    # ── Delta / winner logic ──────────────────────────────────────────────────
+    def _winner(v1, v2, lower_is_better=True):
+        if lower_is_better:
+            if v1 < v2:   return "type1"
+            if v2 < v1:   return "type2"
+        else:
+            if v1 > v2:   return "type1"
+            if v2 > v1:   return "type2"
+        return "tie"
+
+    delta = {
+        # positive diff means Type 2 is worse / larger; negative means Type 2 is better
+        "makespan_hours_diff":       round(t2["makespan_hours"]       - t1["makespan_hours"],       2),
+        "avg_utilization_diff":      round(t2["avg_utilization_pct"]  - t1["avg_utilization_pct"],  2),
+        "total_gaps_diff":                 t2["total_gaps"]           - t1["total_gaps"],
+        "total_idle_hours_diff":     round(t2["total_idle_hours"]     - t1["total_idle_hours"],     2),
+        "computation_time_diff":     round(comp_time2 - comp_time1, 3),
+        # per-metric winners
+        "winner_makespan":     _winner(t1["makespan_hours"],      t2["makespan_hours"]),
+        "winner_utilization":  _winner(t1["avg_utilization_pct"], t2["avg_utilization_pct"], lower_is_better=False),
+        "winner_gaps":         _winner(t1["total_gaps"],          t2["total_gaps"]),
+        "winner_idle_hours":   _winner(t1["total_idle_hours"],    t2["total_idle_hours"]),
+        "winner_speed":        _winner(comp_time1, comp_time2),
+    }
+
+    # Overall: count how many scheduling-quality metrics each type wins
+    # (speed is excluded — it doesn't measure schedule quality)
+    quality_keys = ("winner_makespan", "winner_utilization", "winner_gaps", "winner_idle_hours")
+    scores = {"type1": 0, "type2": 0, "tie": 0}
+    for k in quality_keys:
+        scores[delta[k]] += 1
+
+    if scores["type2"] > scores["type1"]:
+        recommendation = "Type 2 (ERT + MILP) — better overall scheduling quality"
+    elif scores["type1"] > scores["type2"]:
+        recommendation = "Type 1 (Shift-Aware) — better overall scheduling quality"
+    else:
+        recommendation = "Tied — consider Type 1 when shift compliance is mandatory"
+
+    delta["type1_quality_wins"] = scores["type1"]
+    delta["type2_quality_wins"] = scores["type2"]
+    delta["overall_recommendation"] = recommendation
+
+    return {
+        "type1":    t1,
+        "type2":    t2,
+        "delta":    delta,
+        "metadata": {
+            "products_compared": len(products),
+            "start_date":        start_dt.isoformat(),
+            "type2_local_opt_machines": local_opt_machines,
+            "type2_compaction_enabled": enable_compaction,
+        },
     }
 
 

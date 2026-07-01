@@ -1,0 +1,518 @@
+================================================================================
+  EVALUATION METRICS — FORMULAS, CODE, AND WORKED EXAMPLES
+  Project : Production Scheduler (Django + Streamlit)
+  Date    : 2026-07-01
+================================================================================
+
+  The four evaluation metrics are computed inside:
+    compare_schedulers()      → utils.py  line ~1709
+    compute_schedule_kpis()   → utils.py  line ~1644
+    count_schedule_gaps()     → utils.py  line ~238
+    time.perf_counter()       → Python stdlib (Computational Time only)
+
+  All metrics operate on the SAME schedule output:
+    a list of operation dicts, each containing:
+      machine_name  : str    which machine ran this op
+      start_hrs     : float  hours from schedule epoch (t=0)
+      end_hrs       : float  hours from schedule epoch
+      dur_hours     : float  end_hrs − start_hrs  (pre-computed)
+      batch_id      : str    "P2-batch3"
+      step_number   : int
+
+================================================================================
+METRIC 1 — MAKESPAN
+================================================================================
+
+PLAIN ENGLISH
+  How long does the entire schedule take, from the very first operation
+  starting to the very last operation finishing?
+  Lower is better.
+
+────────────────────────────────────────────────────────────────────────────────
+FORMULA
+────────────────────────────────────────────────────────────────────────────────
+
+  Makespan (hours) = max(end_hrs across ALL operations)
+                   − min(start_hrs across ALL operations)
+
+  Makespan (days)  = Makespan (hours) / 24
+
+  In code (compare_schedulers → _metrics):
+  ┌──────────────────────────────────────────────────────┐
+  │  start_h    = min(r["start_hrs"] for r in rows)      │
+  │  end_h      = max(r["end_hrs"]   for r in rows)      │
+  │  makespan_h = end_h - start_h                        │
+  └──────────────────────────────────────────────────────┘
+
+  In code (compute_schedule_kpis):
+  ┌──────────────────────────────────────────────────────┐
+  │  makespan_hours = round(makespan_h, 2)               │
+  │  makespan_days  = round(makespan_h / 24, 2)          │
+  └──────────────────────────────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+WORKED EXAMPLE
+────────────────────────────────────────────────────────────────────────────────
+
+  Setup: 2 products (P1, P2), 2 machines (M1, M2), 2 steps each
+
+  Schedule (hours from t=0):
+  ┌────────┬────────┬───────────┬─────────┐
+  │  Op    │Machine │ start_hrs │ end_hrs │
+  ├────────┼────────┼───────────┼─────────┤
+  │P1-S1   │  M1   │   0.00    │  2.50   │
+  │P1-S2   │  M2   │   2.50    │  5.00   │
+  │P2-S1   │  M1   │   2.50    │  6.00   │
+  │P2-S2   │  M2   │   6.00    │  9.50   │
+  └────────┴────────┴───────────┴─────────┘
+
+  start_h    = min(0.00, 2.50, 2.50, 6.00) = 0.00
+  end_h      = max(2.50, 5.00, 6.00, 9.50) = 9.50
+
+  Makespan (hours) = 9.50 − 0.00 = 9.50 hours
+  Makespan (days)  = 9.50 / 24   = 0.40 days
+
+  Timeline view:
+  t=0       t=2.5      t=5.0      t=7.5      t=9.5
+  |         |          |          |          |
+  M1: [P1-S1]──[P2-S1]────────────|
+  M2:         [P1-S2]──[P2-S2]────|
+                                  ▲
+                              Makespan = 9.5h
+
+  NOTE: Makespan measures the SPAN of the whole schedule, not the sum of
+  all operation durations. Two operations running in parallel do NOT add
+  to makespan — only the last finishing operation sets it.
+
+  Delta shown in Evaluation Metrics page:
+    Δ = Type2_makespan − Type1_makespan
+    Negative Δ → Type 2 finishes earlier (Type 2 wins)
+    Positive Δ → Type 1 finishes earlier (Type 1 wins)
+
+
+================================================================================
+METRIC 2 — MACHINE UTILIZATION
+================================================================================
+
+PLAIN ENGLISH
+  What fraction of the total schedule window was each machine actually
+  doing useful work (not sitting idle)?
+  Higher is better.
+
+────────────────────────────────────────────────────────────────────────────────
+FORMULA
+────────────────────────────────────────────────────────────────────────────────
+
+  PER-MACHINE UTILIZATION:
+
+    Utilization(M) = ( Σ dur_hours of all ops on machine M )
+                     ─────────────────────────────────────── × 100
+                              Makespan (hours)
+
+  AVERAGE UTILIZATION (across all machines):
+
+    Avg Utilization = ( Σ Utilization(M) for all M )
+                      ────────────────────────────────
+                            number of machines
+
+  In code (compute_schedule_kpis):
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  machine_used = defaultdict(float)                                       │
+  │  for row in schedule_rows:                                               │
+  │      machine_used[row['machine_name']] += row['dur_hours']              │
+  │                                                                          │
+  │  utilisation = {                                                         │
+  │      m: round(machine_used[m] / makespan_hours * 100, 2)                │
+  │      for m in machine_used                                               │
+  │  }                                                                       │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  In code (compare_schedulers → _metrics):
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  util_map = kpis.get("utilisation", {})                                  │
+  │  avg_util = round(sum(util_map.values()) / len(util_map), 2)            │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  BOTTLENECK MACHINE:
+    bottleneck = machine with the HIGHEST utilization %
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  bottleneck = max(utilisation, key=utilisation.get)                      │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+WORKED EXAMPLE
+────────────────────────────────────────────────────────────────────────────────
+
+  Using the same schedule from Metric 1:
+
+  ┌────────┬────────┬───────────┬─────────┬───────────┐
+  │  Op    │Machine │ start_hrs │ end_hrs │ dur_hours │
+  ├────────┼────────┼───────────┼─────────┼───────────┤
+  │P1-S1   │  M1   │   0.00    │  2.50   │   2.50    │
+  │P1-S2   │  M2   │   2.50    │  5.00   │   2.50    │
+  │P2-S1   │  M1   │   2.50    │  6.00   │   3.50    │
+  │P2-S2   │  M2   │   6.00    │  9.50   │   3.50    │
+  └────────┴────────┴───────────┴─────────┴───────────┘
+
+  Makespan = 9.50 hours
+
+  M1 total busy time = 2.50 + 3.50 = 6.00 hours
+  M2 total busy time = 2.50 + 3.50 = 6.00 hours
+
+  Utilization(M1) = (6.00 / 9.50) × 100 = 63.16%
+  Utilization(M2) = (6.00 / 9.50) × 100 = 63.16%
+
+  Avg Utilization  = (63.16 + 63.16) / 2 = 63.16%
+  Bottleneck       = M1 (or M2, tied)
+
+  Now with an IDLE GAP on M1 (shows why gaps hurt utilization):
+
+  Suppose M1 is idle from t=2.5 to t=4.0 before P2-S1 starts:
+    M1 busy = 2.50 + (6.00 - 4.00) = 2.50 + 2.00 = 4.50 hours
+    Utilization(M1) = (4.50 / 9.50) × 100 = 47.37%   ← drops significantly
+
+  Visual:
+  t=0    2.5    4.0    6.0    9.5
+  M1: [P1-S1][idle][P2-S1]────|
+  M2:     [P1-S2][───P2-S2───]|
+                               ▲ Makespan
+
+  The idle window on M1 is not counted as busy time, so utilization falls.
+  This is exactly what Idle Gap Reduction (Metric 4) tries to minimise.
+
+  Delta shown in Evaluation Metrics page:
+    Δ = Type2_avg_util − Type1_avg_util
+    Positive Δ → Type 2 uses machines more efficiently (Type 2 wins)
+    Negative Δ → Type 1 uses machines more efficiently (Type 1 wins)
+
+
+================================================================================
+METRIC 3 — COMPUTATIONAL TIME
+================================================================================
+
+PLAIN ENGLISH
+  How many real-world seconds did it take to run the scheduler?
+  Lower is better. This is a speed metric, not a schedule-quality metric.
+
+────────────────────────────────────────────────────────────────────────────────
+FORMULA
+────────────────────────────────────────────────────────────────────────────────
+
+  Computational Time = T_end − T_start
+
+  where T_start and T_end are high-resolution wall-clock timestamps
+  measured with time.perf_counter() (nanosecond precision on modern OS).
+
+  In code (compare_schedulers):
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  t0_1 = time.perf_counter()                                              │
+  │  rows1 = run_shift_aware_scheduler(products, start_dt, ...)              │
+  │  comp_time1 = round(time.perf_counter() - t0_1, 3)    # seconds         │
+  │                                                                          │
+  │  t0_2 = time.perf_counter()                                              │
+  │  rows2 = run_job_shop_scheduler(products, start_dt, ...)                 │
+  │  comp_time2 = round(time.perf_counter() - t0_2, 3)    # seconds         │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  WHY perf_counter() NOT time.time()?
+    time.time()         → wall clock, 1ms precision, can jump (NTP sync)
+    time.perf_counter() → monotonic, nanosecond precision, never jumps
+    For short durations (< 300s), perf_counter is the correct choice.
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT IS INCLUDED IN THE TIME
+────────────────────────────────────────────────────────────────────────────────
+
+  TYPE 1 (Shift-Aware) timing includes:
+    - Building shift windows for 60 days
+    - Extracting process routing from Django ORM
+    - Scheduling all batches of all products with shift-snapping
+    - Writing schedule_rows list
+
+  TYPE 2 (ERT + MILP) timing includes:
+    - Routing extraction from Django ORM
+    - LPT product ordering (sort by total work desc)
+    - Phase 1a: Greedy ERT dispatch with heapq
+    - Phase 1b: Left-shift compaction (up to 5 passes) — IF enabled
+    - Phase 2:  PuLP MILP re-sequencing on top-N bottleneck machines
+    - Topological rebuild of timing after MILP
+
+  Type 2 is almost always slower because of the MILP phase.
+  The trade-off is: more computation → shorter makespan + fewer gaps.
+
+────────────────────────────────────────────────────────────────────────────────
+WORKED EXAMPLE
+────────────────────────────────────────────────────────────────────────────────
+
+  Scenario: 10 products, 6 machines, 5 steps/product (60 operations)
+
+  Type 1 run:
+    t0_1 = 1000.000000 (perf_counter baseline)
+    ... scheduler runs ...
+    t_end_1 = 1000.847000
+    comp_time1 = round(1000.847 - 1000.000, 3) = 0.847 seconds
+
+  Type 2 run:
+    t0_2 = 1000.850000
+    ... scheduler runs (includes MILP) ...
+    t_end_2 = 1012.314000
+    comp_time2 = round(1012.314 - 1000.850, 3) = 11.464 seconds
+
+  Speed ratio = 11.464 / 0.847 = 13.5×  → Type 2 is 13.5× slower
+
+  Delta shown in Evaluation Metrics page:
+    Δ = comp_time2 − comp_time1 = 11.464 − 0.847 = +10.617 s
+    Positive Δ always → Type 1 is always faster (greedy, no MILP)
+    winner_speed is almost always "type1"
+
+  TYPICAL RANGES (depends on data size):
+    Type 1  →  0.1 – 5.0 seconds     (shift-snapping loop)
+    Type 2  →  5.0 – 120.0 seconds   (MILP can be 10–60s alone)
+
+  NOTE: Computational time is NOT used in the overall_recommendation score.
+  Only schedule quality metrics (Makespan, Utilization, Gaps) count.
+  Speed is reported separately as winner_speed, not as a quality win.
+
+
+================================================================================
+METRIC 4 — IDLE GAP REDUCTION
+================================================================================
+
+PLAIN ENGLISH
+  After scheduling, how many idle periods (gaps) does each machine have,
+  and how long are they in total? A gap is a window where a machine is
+  available but not working — wasted capacity.
+  Fewer gaps and fewer idle hours = better schedule.
+
+────────────────────────────────────────────────────────────────────────────────
+FORMULA
+────────────────────────────────────────────────────────────────────────────────
+
+  For a single machine M with operations sorted by start time:
+
+    Gap(i) = start_hrs[i+1] − end_hrs[i]        for i = 1, 2, ..., N-1
+
+  A gap is COUNTED only if:
+    Gap(i) × 3600 > 60 seconds  (i.e., gap > 1 minute)
+    This filters floating-point rounding noise (sub-second artefacts)
+
+  PER-MACHINE:
+    gaps(M)       = count of gaps > 1 min on machine M
+    idle_hours(M) = Σ Gap(i) for all counted gaps on M
+
+  TOTAL ACROSS ALL MACHINES:
+    total_gaps       = Σ gaps(M) for all machines M
+    total_idle_hours = Σ idle_hours(M) for all machines M
+
+  In code (count_schedule_gaps):
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  for m, mops in machine_ops.items():                                     │
+  │      sorted_ops = sorted(mops, key=lambda o: o['start_hrs'])            │
+  │      for i in range(1, len(sorted_ops)):                                 │
+  │          gap_h = sorted_ops[i]['start_hrs'] - sorted_ops[i-1]['end_hrs']│
+  │          if gap_h * 3600 > 60:   # only count gaps > 1 minute           │
+  │              gaps  += 1                                                  │
+  │              idle  += gap_h                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+WHY GAPS EXIST
+────────────────────────────────────────────────────────────────────────────────
+
+  Gaps appear because of:
+    1. Job precedence:  P2-Step2 cannot start until P2-Step1 finishes,
+                        even if its machine is free.
+    2. Batch interleaving: M1 finishes P1-batch3, but P2-batch1 is
+                           still in the step before M1.
+    3. Shift boundaries (Type 1): an operation waits for the next
+                           shift window to open.
+
+  Type 2 explicitly REDUCES gaps via Left-Shift Compaction (Phase 1b):
+    every operation is slid as early as possible while preserving
+    machine non-overlap and job precedence.
+
+────────────────────────────────────────────────────────────────────────────────
+WORKED EXAMPLE
+────────────────────────────────────────────────────────────────────────────────
+
+  Setup: 1 machine (M1), 4 operations
+
+  ┌─────┬───────────┬─────────┬───────────────────────────────────────┐
+  │ Op  │ start_hrs │ end_hrs │ gap after this op → next op           │
+  ├─────┼───────────┼─────────┼───────────────────────────────────────┤
+  │ A   │   0.00    │  2.00   │ 2.00 → 5.00 = 3.00h  (gap 1: 3.00h) │
+  │ B   │   5.00    │  7.50   │ 7.50 → 7.51 = 0.01h  (too small, skip│
+  │ C   │   7.51    │  9.00   │ 9.00 → 12.00 = 3.00h (gap 2: 3.00h) │
+  │ D   │  12.00    │ 14.00   │ (last op, no gap after)               │
+  └─────┴───────────┴─────────┴───────────────────────────────────────┘
+
+  Sorted by start_hrs: A, B, C, D
+
+  Gap scan (i = 1 to 3):
+    i=1: gap = start[B] − end[A]  = 5.00 − 2.00 = 3.00h
+         3.00 × 3600 = 10,800 sec > 60 → COUNT  ✓
+         gaps = 1, idle = 3.00h
+
+    i=2: gap = start[C] − end[B]  = 7.51 − 7.50 = 0.01h
+         0.01 × 3600 = 36 sec ≤ 60 → SKIP (rounding noise)
+
+    i=3: gap = start[D] − end[C]  = 12.00 − 9.00 = 3.00h
+         3.00 × 3600 = 10,800 sec > 60 → COUNT  ✓
+         gaps = 2, idle = 6.00h
+
+  Result for M1:
+    gaps       = 2
+    idle_hours = 6.00
+
+  Visual:
+  t=0   2    4    5    7.5 7.51 9   11  12  14
+  |     |    |    |    |   |    |   |   |   |
+  M1: [A──] [GAP1────][B─][≈0][C──][GAP2──][D─]
+            3.00h idle          3.00h idle
+  total_idle_hours = 6.00h, total_gaps = 2
+
+  ─────────────────────────────────────────────
+  MULTI-MACHINE EXAMPLE (3 machines)
+  ─────────────────────────────────────────────
+
+  M1: gaps = 2,  idle = 6.00h
+  M2: gaps = 1,  idle = 2.50h
+  M3: gaps = 0,  idle = 0.00h  (no gaps at all)
+
+  total_gaps       = 2 + 1 + 0 = 3
+  total_idle_hours = 6.00 + 2.50 + 0.00 = 8.50h
+
+  per_machine = {
+    "M1": { "gaps": 2, "idle_hours": 6.000 },
+    "M2": { "gaps": 1, "idle_hours": 2.500 },
+    "M3": { "gaps": 0, "idle_hours": 0.000 },
+  }
+
+  Delta shown in Evaluation Metrics page:
+    Δ_gaps       = Type2_total_gaps − Type1_total_gaps
+    Δ_idle_hours = Type2_idle_hours − Type1_idle_hours
+
+    Negative Δ_gaps → Type 2 has fewer gaps (compaction worked, Type 2 wins)
+    Positive Δ_gaps → Type 1 has fewer gaps (Type 1 wins)
+
+
+================================================================================
+SUMMARY TABLE — ALL 4 METRICS AT A GLANCE
+================================================================================
+
+  Metric              Formula                              Better   Code Location
+  ──────────────────  ───────────────────────────────────  ───────  ───────────────────────────
+  1. Makespan         max(end_hrs) − min(start_hrs)        Lower    _metrics() in compare_schedulers
+  2. Utilization(M)   Σdur(M) / Makespan × 100            Higher   compute_schedule_kpis()
+     Avg Utilization  Σ Util(M) / num_machines             Higher   _metrics() avg_util calc
+  3. Comp. Time       perf_counter() end − start (sec)     Lower    compare_schedulers() t0 / t_end
+  4. Gaps(M)         count(start[i+1]−end[i] > 1min)      Fewer    count_schedule_gaps()
+     Idle Hours(M)   Σ (start[i+1]−end[i]) for counted    Fewer    count_schedule_gaps()
+
+  WINNER LOGIC  (from compare_schedulers → _winner):
+
+    Makespan   : lower_is_better=True   → if T2 < T1: "type2 wins"
+    Utilization: lower_is_better=False  → if T2 > T1: "type2 wins"
+    Comp. Time : lower_is_better=True   → almost always "type1 wins"
+    Gaps       : lower_is_better=True   → if T2 < T1: "type2 wins" (compaction)
+
+  OVERALL RECOMMENDATION is based on 4 quality metrics only
+  (Makespan, Utilization, Idle Gaps, Idle Hours).
+  Computational Time is tracked as winner_speed but NOT counted in the
+  overall quality score — speed is a trade-off, not a scheduling quality metric.
+
+
+================================================================================
+FULL NUMERICAL EXAMPLE — ALL 4 METRICS TOGETHER
+================================================================================
+
+  Scenario: 3 products (P1, P2, P3), 3 machines (M1, M2, M3), seed=42
+  Schedule start: 2026-01-01 00:00
+
+  ── Hypothetical Type 1 output ───────────────────────────────────────────────
+
+  Op           Machine  start_hrs  end_hrs  dur_hours
+  P1-batch1-S1   M1      0.00       3.00     3.00
+  P1-batch1-S2   M2      3.00       7.00     4.00
+  P1-batch1-S3   M3      8.00      14.00     6.00   ← gap on M3 from 7→8
+  P2-batch1-S1   M1      3.00       6.00     3.00
+  P2-batch1-S2   M2      8.00      12.00     4.00   ← gap on M2 from 7→8
+  P2-batch1-S3   M3     14.00      20.00     6.00
+  P3-batch1-S1   M1      6.00       9.00     3.00
+  P3-batch1-S2   M2     12.00      16.00     4.00
+  P3-batch1-S3   M3     20.00      26.00     6.00
+
+  ── METRIC 1: Makespan (Type 1) ──────────────────────────────────────────────
+
+  start_h = min(0,3,8,3,8,14,6,12,20) = 0.00
+  end_h   = max(3,7,14,6,12,20,9,16,26) = 26.00
+
+  Makespan = 26.00 − 0.00 = 26.00 hours = 1.08 days
+
+  ── METRIC 2: Utilization (Type 1) ───────────────────────────────────────────
+
+  M1 busy = 3.00 + 3.00 + 3.00 = 9.00h
+  M2 busy = 4.00 + 4.00 + 4.00 = 12.00h
+  M3 busy = 6.00 + 6.00 + 6.00 = 18.00h
+
+  Util(M1) = (9.00  / 26.00) × 100 = 34.62%
+  Util(M2) = (12.00 / 26.00) × 100 = 46.15%
+  Util(M3) = (18.00 / 26.00) × 100 = 69.23%
+
+  Avg Util  = (34.62 + 46.15 + 69.23) / 3 = 50.00%
+  Bottleneck = M3 @ 69.23%
+
+  ── METRIC 3: Computational Time (Type 1) ────────────────────────────────────
+
+  t0_1        = perf_counter()
+  run_shift_aware_scheduler(...)
+  comp_time1  = perf_counter() − t0_1 = 0.312 seconds
+
+  ── METRIC 4: Idle Gaps (Type 1) ─────────────────────────────────────────────
+
+  M1: ops sorted by start → [0→3, 3→6, 6→9]
+    gap(1) = 3−3 = 0.00h  → 0 sec  SKIP
+    gap(2) = 6−6 = 0.00h  → 0 sec  SKIP
+    M1: gaps=0, idle=0.00h
+
+  M2: ops sorted by start → [3→7, 8→12, 12→16]
+    gap(1) = 8−7 = 1.00h  → 3600 sec > 60  COUNT
+    gap(2) = 12−12 = 0.00h → 0 sec  SKIP
+    M2: gaps=1, idle=1.00h
+
+  M3: ops sorted by start → [8→14, 14→20, 20→26]
+    gap(1) = 14−14 = 0.00h → 0 sec  SKIP
+    gap(2) = 20−20 = 0.00h → 0 sec  SKIP
+    M3: gaps=0, idle=0.00h
+
+  total_gaps       = 0 + 1 + 0 = 1
+  total_idle_hours = 0 + 1.00 + 0 = 1.00h
+
+  ─────────────────────────────────────────────────────────────────────────────
+  HYPOTHETICAL TYPE 2 RESULTS (after ERT + compaction + MILP)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  Makespan         : 21.00 hours (compaction closed gaps → 5h shorter)
+  Avg Utilization  : 61.90%      (same busy hours, shorter makespan → higher %)
+  Computational Time: 8.740 seconds
+  Total Gaps       : 0           (compaction eliminated the M2 gap)
+  Total Idle Hours : 0.00h
+
+  ── DELTA COMPARISON ─────────────────────────────────────────────────────────
+
+  Metric              Type 1    Type 2    Δ (T2−T1)   Winner
+  ──────────────────  ────────  ────────  ──────────  ────────
+  Makespan (hrs)      26.00     21.00     −5.00       Type 2  ✓
+  Avg Utilization (%) 50.00     61.90     +11.90      Type 2  ✓
+  Computational (sec) 0.312     8.740     +8.428      Type 1  ✓ (speed)
+  Total Gaps          1         0         −1          Type 2  ✓
+  Total Idle Hours    1.00h     0.00h     −1.00h      Type 2  ✓
+
+  Quality wins: Type 1 = 0/4,  Type 2 = 4/4
+  Recommendation: "Type 2 (ERT + MILP) — better overall scheduling quality"
+  (Speed winner is Type 1, but speed is not counted in quality score)
+
+
+================================================================================
+  END OF DOCUMENT
+================================================================================

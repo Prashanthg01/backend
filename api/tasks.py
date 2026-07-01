@@ -21,6 +21,7 @@ from .utils import (
     optimize_product_batches_jointly,
     calculate_optimal_batch_size,
     validate_schedule,
+    compare_schedulers,
 )
 import traceback
 
@@ -467,6 +468,33 @@ def generate_schedule_task(self, params: dict):
         # Abort early if there is nothing to schedule
         if not products:
             return {'status': 'error', 'message': 'No products with demand found in the database.'}
+
+        # -------------------------------------------------------------
+        # STEP 3b: Joint batch optimisation (Type 2 only)
+        # Runs a multi-product MILP that picks batch sizes for all
+        # products simultaneously, minimising the worst-case machine
+        # load (makespan proxy). This balances work across machines
+        # before scheduling, which directly reduces idle gaps.
+        #
+        # Skipped when:
+        #   - schedule_type == 1  (shift-aware; batch sizes are fixed)
+        #   - optimize_batches == False  (caller opted out explicitly)
+        #   - batch_override covers all products  (manual override wins)
+        # -------------------------------------------------------------
+        if schedule_type == 2 and params.get('optimize_batches', True):
+            _progress(12, f"Optimising batch sizes for {len(products)} products…")
+            opt_result = optimize_product_batches_jointly(
+                products,
+                max_num_batches    = int(params.get('max_num_batches', 25)),
+                min_batch_size     = int(params.get('min_batch_size',   50)),
+                max_batch_size     = int(params.get('max_batch_size',  500)),
+                time_limit_seconds = 90,
+            )
+            _progress(22, (
+                f"Batch optimisation {opt_result['status']} — "
+                f"{opt_result['products_updated']} products updated, "
+                f"makespan proxy: {opt_result['makespan_proxy']:.1f}h"
+            ))
 
         # -------------------------------------------------------------
         # STEP 4: Run the scheduler (type chosen by caller)
@@ -1144,4 +1172,80 @@ def initialize_data_task(
     except Exception as exc:
         error_trace = traceback.format_exc()
         print(error_trace)
+        return {"status": "error", "message": str(exc), "traceback": error_trace}
+
+
+# ===========================================================================
+# SCHEDULER COMPARISON TASK
+# ===========================================================================
+
+@shared_task(bind=True, name="compare_schedulers_task")
+def compare_schedulers_task(self, params: dict):
+    """
+    Background task that runs both schedulers on the same product set and
+    returns a side-by-side comparison of the four evaluation metrics.
+
+    Params (dict keys)
+    ------------------
+    start_date          : str   ISO date string (default: today at midnight)
+    product_pks         : list  Specific product PKs to include (default: all)
+    local_opt_machines  : int   Type 2 Phase-2 MILP machines (default 5)
+    enable_compaction   : bool  Type 2 left-shift compaction (default True)
+    batch_overrides     : list  [[pk, batch_size, num_batches], ...]
+
+    Returns
+    -------
+    dict with keys: type1, type2, delta, metadata, status
+    """
+    def _progress(pct, msg):
+        self.update_state(state="PROGRESS", meta={"progress": pct, "status": msg})
+
+    try:
+        _progress(5, "Parsing parameters…")
+
+        start_str  = params.get("start_date")
+        start_dt   = (
+            datetime.fromisoformat(start_str)
+            if start_str
+            else datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        )
+        local_opt  = int(params.get("local_opt_machines", 5))
+        compaction = bool(params.get("enable_compaction", True))
+
+        # Build batch_override dict from [[pk, bs, nb], …] list
+        batch_override = {}
+        for entry in (params.get("batch_overrides") or []):
+            try:
+                pk, bs, nb = int(entry[0]), int(entry[1]), int(entry[2])
+                batch_override[pk] = (bs, nb)
+            except (IndexError, ValueError, TypeError):
+                pass
+
+        _progress(10, "Loading products…")
+        pks = params.get("product_pks")
+        if pks:
+            products = list(Product.objects.filter(pk__in=pks, demand_2024__gt=0))
+        else:
+            products = list(Product.objects.filter(demand_2024__gt=0))
+
+        if not products:
+            return {"status": "error", "message": "No products found."}
+
+        _progress(15, "Starting comparison…")
+
+        result = compare_schedulers(
+            products,
+            start_dt,
+            local_opt_machines  = local_opt,
+            enable_compaction   = compaction,
+            batch_override      = batch_override or None,
+            progress_callback   = _progress,
+        )
+
+        result["status"] = "success"
+        return result
+
+    except Exception as exc:
+        error_trace = traceback.format_exc()
+        logger.error("compare_schedulers_task failed: %s", error_trace)
         return {"status": "error", "message": str(exc), "traceback": error_trace}

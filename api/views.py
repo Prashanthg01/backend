@@ -1280,6 +1280,110 @@ def schedule_comparison(request):
 
 
 # ===========================================================================
+# SCHEDULER COMPARATIVE ANALYSIS  (Type 1 vs Type 2)
+# ===========================================================================
+
+@api_view(["GET"])
+def compare_schedulers_view(request):
+    """
+    GET /api/compare-schedulers/
+
+    Run Type 1 (Shift-Aware) and Type 2 (ERT + MILP) on the same product
+    set and return a side-by-side comparison of the four evaluation metrics:
+      1. Makespan           – total hours from first start to last end
+      2. Machine Utilization – per-machine and average utilisation %
+      3. Computational Time  – wall-clock seconds per scheduler
+      4. Idle Gap Reduction  – gap count and total idle hours per scheduler
+
+    Query parameters
+    ----------------
+    start_date           : YYYY-MM-DD  (default: today at midnight)
+    product_pks          : repeatable  (default: all products)
+    local_opt_machines   : int         Type 2 MILP machines (default 5)
+    enable_compaction    : bool        Type 2 compaction     (default true)
+    async_mode           : bool        Run in background via Celery (default false)
+
+    Sync response (200)
+    -------------------
+    { type1: {...}, type2: {...}, delta: {...}, metadata: {...} }
+
+    Async response (202)
+    --------------------
+    { task_id, status, message, check_status_url }
+
+    Step-by-step
+    ------------
+    1. Parse query parameters.
+    2. Validate prerequisite data (products + process steps).
+    3. Async: enqueue compare_schedulers_task and return task metadata.
+    4. Sync: call compare_schedulers() inline and return result.
+    """
+    try:
+        from datetime import datetime as _dt
+        from .utils import compare_schedulers
+
+        # ── Step 1: Parse parameters ───────────────────────────────────────────
+        start_str  = request.query_params.get("start_date")
+        start_dt   = (
+            _dt.fromisoformat(start_str)
+            if start_str
+            else _dt.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        )
+        local_opt  = int(request.query_params.get("local_opt_machines", 5))
+        compaction = str(request.query_params.get("enable_compaction", "true")).lower() == "true"
+        async_mode = str(request.query_params.get("async_mode", "false")).lower() == "true"
+
+        pks = request.query_params.getlist("product_pks")
+
+        # ── Step 2: Validate prerequisite data ────────────────────────────────
+        if not Product.objects.filter(demand_2024__gt=0).exists():
+            return Response(
+                {"error": "No products found. Run Initialize Data first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not ProcessStep.objects.exists():
+            return Response(
+                {"error": "No process steps found. Run Initialize Data first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── Step 3: Async path ─────────────────────────────────────────────────
+        if async_mode:
+            from .tasks import compare_schedulers_task
+            task = compare_schedulers_task.delay({
+                "start_date":          start_str,
+                "product_pks":         [int(p) for p in pks] if pks else None,
+                "local_opt_machines":  local_opt,
+                "enable_compaction":   compaction,
+            })
+            return Response({
+                "task_id":          task.id,
+                "status":           "processing",
+                "message":          "Scheduler comparison started in background.",
+                "check_status_url": f"/api/task-status/{task.id}/",
+            }, status=status.HTTP_202_ACCEPTED)
+
+        # ── Step 4: Sync path ──────────────────────────────────────────────────
+        products = (
+            list(Product.objects.filter(pk__in=pks, demand_2024__gt=0))
+            if pks
+            else list(Product.objects.filter(demand_2024__gt=0))
+        )
+
+        result = compare_schedulers(
+            products,
+            start_dt,
+            local_opt_machines = local_opt,
+            enable_compaction  = compaction,
+        )
+        return Response(result)
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ===========================================================================
 # OPTIMIZE SCHEDULE PREVIEW & SAVE
 # ===========================================================================
 
