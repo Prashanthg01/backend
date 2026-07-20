@@ -430,7 +430,6 @@ def get_buffer_optimization(request):
 
         # Step 2: Parse request parameters used by buffer sizing logic.
         safety_factor = float(request.GET.get('safety_factor', 1.5))
-        total_budget  = request.GET.get('total_budget')
 
         # Step 3: Compute makespan and throughput baseline.
         min_start      = schedules.aggregate(Min('start_time'))['start_time__min']
@@ -472,11 +471,6 @@ def get_buffer_optimization(request):
                 ),
             })
 
-        # Step 5: Apply LP-based constrained allocation when budget is provided.
-        if total_budget is not None:
-            total_budget = float(total_budget)
-            buffer_data  = pulp_optimize_buffers(buffer_data, total_budget)
-
         # Step 6: Sort worst-to-best by required buffer for UI consumption.
         buffer_data.sort(key=lambda x: x['required_buffer'], reverse=True)
 
@@ -490,13 +484,6 @@ def get_buffer_optimization(request):
             },
             'formula': 'required_buffer = throughput_per_hour × avg_operation_time_hours × safety_factor',
         }
-
-        if total_budget is not None:
-            response_payload['pulp_allocation'] = {
-                'total_budget':    total_budget,
-                'total_required':  round(sum(d['required_buffer']             for d in buffer_data), 2),
-                'total_allocated': round(sum(d.get('allocated_buffer', 0) for d in buffer_data), 2),
-            }
 
         return Response(response_payload, status=status.HTTP_200_OK)
 

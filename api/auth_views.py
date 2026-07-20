@@ -51,14 +51,14 @@ def logout(request):
     return Response({'detail': 'Logged out.'}, status=status.HTTP_200_OK)
 
 
-@api_view(['GET'])
-def me(request):
-    """
-    Return current authenticated user info.
-    """
-    return Response({
-        'user': {
-            'id': request.user.pk,
-            'username': request.user.username,
-        }
-    }, status=status.HTTP_200_OK)
+# @api_view(['GET'])
+# def me(request):
+#     """
+#     Return current authenticated user info.
+#     """
+#     return Response({
+#         'user': {
+#             'id': request.user.pk,
+#             'username': request.user.username,
+#         }
+#     }, status=status.HTTP_200_OK)

@@ -1,0 +1,246 @@
+================================================================================
+  BATCH OPTIMIZATION - FORMULAS, CODE, AND WORKED EXAMPLES
+  Project : Production Scheduler (Django + Streamlit)
+  Date    : 2026-07-15
+================================================================================
+
+  Batch optimization is implemented in:
+
+    API endpoints:
+      get_batch_optimization_preview() -> backend/api/views.py
+      calculate_optimal_batch_size()  -> backend/api/utils.py
+      optimize_product_batches_jointly() -> backend/api/utils.py
+
+    Background tasks:
+      batch_optimize_preview_task() -> backend/api/tasks.py
+
+    Streamlit UI:
+      Batch Optimization section in frontend/app.py (currently commented out)
+
+
+================================================================================
+WHAT BATCH OPTIMIZATION MEANS
+================================================================================
+
+PLAIN ENGLISH
+
+  Batch optimization determines how many units should be grouped into each
+  production batch and how many batches are needed to cover the demand for a
+  product.
+
+  The system answers two related questions:
+
+    1. How many batches should each product use?
+    2. What batch size should each batch have?
+
+  The goal is to reduce the number of setup changes and improve schedule
+  efficiency while staying within bounds set by the user.
+
+
+================================================================================
+CORE INPUTS
+================================================================================
+
+  Inputs used by the optimizer:
+
+    demand
+      Product yearly demand (from Product.demand_2024)
+
+    max_num_batches
+      Default: 25
+      Upper limit on the number of batches allowed per product
+
+    min_batch_size
+      Default: 50
+      Lower bound for each batch size
+
+    max_batch_size
+      Default: 500
+      Upper bound for each batch size
+
+  The optimizer uses these values to choose a feasible batch plan.
+
+
+================================================================================
+SINGLE-PRODUCT BATCH OPTIMIZATION
+================================================================================
+
+PLAIN ENGLISH
+
+  For each product, the code solves an Integer Linear Program (ILP) to choose
+  the batch size and number of batches that minimize the number of batches.
+
+  Fewer batches means fewer setup changes, which tends to reduce scheduling
+  complexity and improve efficiency.
+
+
+STEP 1 - IDEAL BATCH SIZE
+================================================================================
+
+FORMULA
+
+  ideal_batch_size = demand / max_num_batches
+
+CODE LOGIC
+
+  ideal_batch_size = demand / max_num_batches
+
+WHY THIS MATTERS
+
+  This is the theoretical batch size if there were no bounds and we wanted to
+  spread demand evenly across the maximum allowed number of batches.
+
+
+STEP 2 - ADAPTIVE EFFECTIVE BOUNDS
+================================================================================
+
+PLAIN ENGLISH
+
+  The original implementation used the raw user min/max values directly. That
+  could create infeasible or bad solutions for small or large demand cases.
+
+  The fixed version clamps the bounds to a demand-feasible range.
+
+FORMULA
+
+  effective_min_batch = max(min_batch_size, ceil(demand / max_num_batches))
+
+  effective_max_batch = min(max_batch_size, demand)
+
+CODE LOGIC
+
+  eff_min, eff_max = _adaptive_bounds(
+      demand, max_num_batches, min_batch_size, max_batch_size
+  )
+
+WHY THIS MATTERS
+
+  This prevents impossible cases such as:
+
+    - batch size too large for low demand
+    - batch size too small for high demand
+
+
+STEP 3 - ILP DECISION VARIABLES
+================================================================================
+
+PLAIN ENGLISH
+
+  The optimizer creates an integer programming model with:
+
+    B = batch size
+    N = number of batches
+    y_n = binary variable indicating whether exactly n batches are chosen
+
+FORMULAS
+
+  Objective:
+    minimize N
+
+  Constraints:
+    B × N >= demand
+    min_batch_size <= B <= max_batch_size
+    1 <= N <= max_num_batches
+
+CODE LOGIC
+
+  prob = LpProblem("BatchSizeOptimization", LpMinimize)
+
+  B = LpVariable("batch_size", lowBound=eff_min, upBound=eff_max, cat=LpInteger)
+  N = LpVariable("num_batches", lowBound=1, upBound=max_num_batches, cat=LpInteger)
+
+  prob += N
+
+  for n in candidates:
+      required_B = ceil(demand / n)
+      prob += B >= required_B - M * (1 - y[n])
+
+
+STEP 4 - SOLUTION
+================================================================================
+
+PLAIN ENGLISH
+
+  If the ILP is solved optimally, the code returns the integer batch size and
+  number of batches that minimize the batch count.
+
+CODE LOGIC
+
+  if LpStatus[prob.status] == "Optimal":
+      opt_B = max(eff_min, min(eff_max, int(round(value(B)))))
+      opt_N = max(1, min(max_num_batches, int(round(value(N)))))
+      return opt_B, opt_N, round(ideal_batch_size, 2)
+
+
+================================================================================
+WORKED EXAMPLE
+================================================================================
+
+EXAMPLE 1 - SINGLE PRODUCT
+
+  Suppose:
+    demand = 121
+    max_num_batches = 25
+    min_batch_size = 50
+    max_batch_size = 500
+
+  Ideal batch size:
+    121 / 25 = 4.84
+
+  The optimizer will choose a feasible batch plan such that:
+    batch_size × num_batches >= 121
+
+  If the solver chooses 3 batches, then:
+    batch_size = ceil(121 / 3) = 41
+
+  This is then adjusted to stay within the effective bounds.
+
+EXAMPLE 2 - LARGE DEMAND
+
+  Suppose:
+    demand = 319908
+    max_num_batches = 25
+    min_batch_size = 50
+    max_batch_size = 500
+
+  The optimizer checks whether a feasible solution exists within the bounds.
+
+
+================================================================================
+SUMMARY OF THE OPTIMIZATION LOGIC
+================================================================================
+
+  The system optimizes batch size by:
+
+    1. Choosing a number of batches N
+    2. Ensuring the required batch size B satisfies B × N >= demand
+    3. Keeping B within allowed bounds
+    4. Minimizing N for efficiency
+
+  In the joint version, it also tries to balance machine loads across all
+  products, not just minimize the batch count for each product independently.
+
+
+================================================================================
+WHERE THIS IS IMPLEMENTED
+================================================================================
+
+  Main functions:
+
+    backend/api/utils.py
+      - calculate_optimal_batch_size()
+      - optimize_product_batches_jointly()
+
+    backend/api/views.py
+      - get_batch_optimization_preview()
+
+    backend/api/tasks.py
+      - batch_optimize_preview_task()
+
+
+================================================================================
+NOTES
+================================================================================
+
+  The current Streamlit frontend has the batch optimization UI commented out,
+  but the backend logic still exists and can be enabled again when needed.

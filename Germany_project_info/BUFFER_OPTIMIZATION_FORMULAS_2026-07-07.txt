@@ -1,0 +1,422 @@
+================================================================================
+  BUFFER OPTIMIZATION - FORMULAS, CODE, AND WORKED EXAMPLES
+  Project : Production Scheduler (Django + Streamlit)
+  Date    : 2026-07-15
+================================================================================
+
+  Buffer optimization is implemented in:
+
+    API endpoint:
+      get_buffer_optimization()    -> backend/api/views.py  line ~413
+
+    Streamlit page:
+      "Buffer Optimization"        -> frontend/app.py       line ~2916
+
+  The page recommends buffer size per machine from the current saved
+  production schedule.
+
+
+================================================================================
+WHAT BUFFER OPTIMIZATION MEANS
+================================================================================
+
+PLAIN ENGLISH
+
+  A buffer is extra material, WIP, space, or capacity kept before/around a
+  machine so that the machine does not stop when upstream flow is irregular.
+
+  The system answers one question:
+
+    How much buffer does each machine need?
+
+  The API always returns the full recommended buffer requirement for every
+  machine, based on schedule statistics and a safety factor.
+
+
+================================================================================
+INPUTS USED BY THE BUFFER PAGE
+================================================================================
+
+  User inputs from Streamlit:
+
+    safety_factor
+      Default: 1.5
+      Range  : 1.0 to 3.0
+      Meaning: extra protection above the baseline calculated buffer.
+
+  Data read from database:
+
+    ProductionSchedule
+      start_time
+      end_time
+      duration_hours
+      machine
+
+    Product
+      demand_2024
+
+    Machine
+      machine name and schedule relationship
+
+
+================================================================================
+STEP 1 - SCHEDULE AVAILABILITY CHECK
+================================================================================
+
+PLAIN ENGLISH
+
+  Buffer optimization needs a schedule. If no schedule rows exist, the API
+  returns a friendly message instead of computing empty recommendations.
+
+CODE LOGIC
+
+  schedules = ProductionSchedule.objects.all()
+
+  if not schedules.exists():
+      return Response({"message": "No schedules available"}, status=200)
+
+WHY THIS MATTERS
+
+  Required buffer is derived from actual scheduled operation durations,
+  machine utilization, and total schedule makespan. Without a schedule, those
+  values are undefined.
+
+
+================================================================================
+STEP 2 - MAKESPAN
+================================================================================
+
+PLAIN ENGLISH
+
+  Makespan is the total schedule window from the earliest scheduled operation
+  start to the latest scheduled operation finish.
+
+FORMULA
+
+  min_start = earliest ProductionSchedule.start_time
+  max_end   = latest   ProductionSchedule.end_time
+
+  makespan_hours = (max_end - min_start) in hours
+
+CODE LOGIC
+
+  min_start = schedules.aggregate(Min("start_time"))["start_time__min"]
+  max_end   = schedules.aggregate(Max("end_time"))["end_time__max"]
+
+  makespan_hours = (max_end - min_start).total_seconds() / 3600
+
+WORKED EXAMPLE
+
+  Earliest operation starts: 2026-01-01 08:00
+  Latest operation ends    : 2026-01-03 08:00
+
+  makespan_hours = 48.00 hours
+
+
+================================================================================
+STEP 3 - THROUGHPUT PER HOUR
+================================================================================
+
+PLAIN ENGLISH
+
+  Throughput per hour estimates how many product units the schedule must
+  support per hour across the whole planning window.
+
+FORMULA
+
+  total_units = sum(demand_2024 for products where demand_2024 > 0)
+
+  throughput_per_hour = total_units / makespan_hours
+
+  If makespan_hours is 0, throughput_per_hour is set to 0 to avoid division
+  by zero.
+
+CODE LOGIC
+
+  total_units = Product.objects.filter(demand_2024__gt=0).aggregate(
+      total=Sum("demand_2024")
+  )["total"] or 0
+
+  throughput_per_hour = (
+      total_units / makespan_hours
+      if makespan_hours > 0
+      else 0
+  )
+
+WORKED EXAMPLE
+
+  total_units    = 9,600 units
+  makespan_hours = 48 hours
+
+  throughput_per_hour = 9,600 / 48
+                      = 200 units/hour
+
+
+================================================================================
+STEP 4 - PER-MACHINE STATISTICS
+================================================================================
+
+PLAIN ENGLISH
+
+  For every machine that appears in the schedule, the API calculates:
+
+    average operation duration
+    total busy hours
+    utilization percentage
+    required buffer
+    priority label
+
+FORMULAS
+
+  avg_operation_time_hours(M)
+      = average(duration_hours for scheduled operations on machine M)
+
+  used_hours(M)
+      = sum(duration_hours for scheduled operations on machine M)
+
+  utilization(M)
+      = used_hours(M) / makespan_hours * 100
+
+  required_buffer(M)
+      = throughput_per_hour * avg_operation_time_hours(M) * safety_factor
+
+CODE LOGIC
+
+  avg_duration_hours = machine_schedules.aggregate(
+      avg=Avg("duration_hours")
+  )["avg"] or 0
+
+  used_hours = machine_schedules.aggregate(
+      total=Sum("duration_hours")
+  )["total"] or 0
+
+  utilization = (
+      used_hours / makespan_hours * 100
+      if makespan_hours > 0
+      else 0
+  )
+
+  required_buffer = (
+      throughput_per_hour * avg_duration_hours * safety_factor
+  )
+
+
+================================================================================
+STEP 5 - PRIORITY LABEL
+================================================================================
+
+PLAIN ENGLISH
+
+  The recommendation label is based on utilization. More utilized machines are
+  more sensitive to buffer shortage because any starvation at those machines
+  can block more of the schedule.
+
+RULES
+
+  if utilization > 80:
+      recommendation = "HIGH PRIORITY"
+
+  elif utilization > 60:
+      recommendation = "MEDIUM PRIORITY"
+
+  else:
+      recommendation = "LOW PRIORITY"
+
+INTERPRETATION
+
+  HIGH PRIORITY
+    Machine is heavily loaded. A shortage here is more likely to create
+    bottlenecks or downstream delays.
+
+  MEDIUM PRIORITY
+    Machine is meaningfully loaded but not the main constraint.
+
+  LOW PRIORITY
+    Machine has more schedule slack. Buffer shortage is less critical.
+
+
+================================================================================
+STEP 6 - BUFFER RECOMMENDATION (ALWAYS UNCONSTRAINED)
+================================================================================
+
+PLAIN ENGLISH
+
+  The API always reports the full required buffer for each machine. There is
+  no budget input and no allocation step — every machine's recommended buffer
+  is simply its calculated requirement.
+
+FORMULA
+
+  buffer_size_units(M) = required_buffer(M)
+
+API RESPONSE FIELDS
+
+  machine
+  required_buffer
+  buffer_size_units
+  avg_operation_time_hours
+  throughput_per_hour
+  safety_factor
+  utilization
+  total_operations
+  recommendation
+
+WORKED EXAMPLE
+
+  Global schedule values:
+
+    total_units         = 9,600 units
+    makespan_hours      = 48 hours
+    throughput_per_hour = 200 units/hour
+    safety_factor       = 1.5
+
+  Machine M1:
+
+    avg_operation_time_hours = 0.50 hours
+    used_hours               = 42 hours
+    utilization              = 42 / 48 * 100 = 87.50 percent
+
+    required_buffer = 200 * 0.50 * 1.5
+                    = 150 units
+
+    buffer_size_units = 150 units
+    recommendation    = HIGH PRIORITY
+
+  Machine M2:
+
+    avg_operation_time_hours = 0.25 hours
+    used_hours               = 30 hours
+    utilization              = 30 / 48 * 100 = 62.50 percent
+
+    required_buffer = 200 * 0.25 * 1.5
+                    = 75 units
+
+    buffer_size_units = 75 units
+    recommendation    = MEDIUM PRIORITY
+
+
+================================================================================
+STREAMLIT UI BEHAVIOR
+================================================================================
+
+PAGE
+
+  Sidebar page:
+
+    "Buffer Optimization"
+
+CONTROLS
+
+  Safety Factor
+    number_input
+    min_value = 1.0
+    max_value = 3.0
+    default   = 1.5
+    step      = 0.1
+
+  Load Buffer Data
+    Calls:
+      GET /api/buffer-optimization/
+
+REQUEST PARAMETERS
+
+  Always sent:
+
+    safety_factor
+
+DISPLAYED OUTPUT
+
+  Production Parameters:
+
+    Throughput/Hour
+    Makespan
+    Safety Factor
+    Total Units
+
+  Formula:
+
+    required_buffer = throughput_per_hour * avg_operation_time_hours
+                      * safety_factor
+
+  Charts:
+
+    Recommended Buffer Sizes by Machine
+    Utilization vs Buffer Requirements
+
+  Table:
+
+    Detailed Buffer Recommendations
+
+  Export:
+
+    buffer_recommendations.csv
+
+
+================================================================================
+API RESPONSE SHAPE
+================================================================================
+
+  {
+    "buffer_recommendations": [
+      {
+        "machine": "M1",
+        "required_buffer": 150.0,
+        "buffer_size_units": 150.0,
+        "avg_operation_time_hours": 0.5,
+        "throughput_per_hour": 200.0,
+        "safety_factor": 1.5,
+        "utilization": 87.5,
+        "total_operations": 40,
+        "recommendation": "HIGH PRIORITY"
+      }
+    ],
+    "parameters": {
+      "throughput_per_hour": 200.0,
+      "makespan_hours": 48.0,
+      "safety_factor": 1.5,
+      "total_units": 9600
+    },
+    "formula": "required_buffer = throughput_per_hour * avg_operation_time_hours * safety_factor"
+  }
+
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+  Item                         Formula / Rule                         Better
+  ---------------------------  -------------------------------------  --------
+  Makespan                     max(end_time) - min(start_time)        Lower
+  Throughput/hour              total_units / makespan_hours           Context
+  Avg op time                  avg(duration_hours) per machine        Context
+  Machine utilization          used_hours / makespan_hours * 100      Context
+  Required buffer              throughput/hour * avg_op_time * SF     Sized need
+  Priority HIGH                utilization > 80 percent               Critical
+  Priority MEDIUM              utilization > 60 percent               Watch
+  Priority LOW                 otherwise                              Lower risk
+
+
+================================================================================
+IMPORTANT INTERPRETATION NOTES
+================================================================================
+
+  1. Buffer size is not calculated from utilization directly.
+
+     Required buffer is calculated from:
+
+       throughput_per_hour * avg_operation_time_hours * safety_factor
+
+     Utilization only affects the priority label.
+
+  2. Safety factor scales every machine requirement.
+
+     If safety_factor increases from 1.5 to 2.0, every required_buffer grows
+     proportionally.
+
+  3. There is no budget concept anymore. Every machine is always shown its
+     full required buffer — nothing is capped, allocated, or short-changed.
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
